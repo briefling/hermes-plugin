@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -150,6 +150,10 @@ CONTEXT_ITEM_MAX = 2000
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_FILES = 10
 INLINE_IMAGES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+# Outbound audio: a fixed type per extension (mimetypes differs between macOS and Linux and lacks some), each one the
+# hub serves inline so the client shows a player (INLINE_AUDIO_MIME in protocol/frames.ts).
+AUDIO_TYPES = {".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+               ".aac": "audio/aac", ".wav": "audio/wav", ".flac": "audio/flac", ".weba": "audio/webm"}
 
 
 def is_s3_url(url: Any) -> bool:
@@ -673,7 +677,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         if not 0 < size <= MAX_FILE_BYTES:
             return None
         name = file_name or os.path.basename(path)
-        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        mime = AUDIO_TYPES.get(os.path.splitext(name)[1].lower()) or mimetypes.guess_type(name)[0] or "application/octet-stream"
         try:
             ready = await self._request({"type": "upload", "space": space, "name": name, "mime": mime, "size": size})
         except Exception as e:
@@ -797,6 +801,11 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         return await self._send_file(chat_id, image_path, caption)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+        """Audio (TTS reply, MEDIA tag): posted as an attachment, the client shows a player."""
+        return await self._send_file(chat_id, audio_path, caption)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
                             reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
