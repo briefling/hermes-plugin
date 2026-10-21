@@ -1,0 +1,35 @@
+name: briefling
+label: briefling
+kind: platform
+version: 0.2.0
+author: opcode
+description: >
+  briefling gateway adapter: one outbound WebSocket to the briefling hub (AWS).
+  A thread is a chat; turn start/end, streamed replies and clarify prompts map to
+  the hub protocol. No inbound port. Authentication via a Cognito M2M client.
+requires_env:
+  - name: BRIEFLING_WS_URL
+    description: "Hub WebSocket URL (wss://...)"
+    prompt: "briefling hub WebSocket URL"
+    password: false
+  - name: BRIEFLING_TOKEN_URL
+    description: "Cognito token endpoint (https://.../oauth2/token)"
+    prompt: "briefling token URL"
+    password: false
+  - name: BRIEFLING_CLIENT_ID
+    description: "Cognito M2M client id of this instance"
+    prompt: "briefling client id"
+    password: false
+  - name: BRIEFLING_CLIENT_SECRET
+    description: "Cognito M2M client secret of this instance"
+    prompt: "briefling client secret"
+    password: true
+optional_env:
+  - name: BRIEFLING_SPACES
+    description: "Comma-separated spaces this instance serves"
+    prompt: "briefling spaces"
+    password: false
+  - name: BRIEFLING_ALLOWED_USERS
+    description: "Comma-separated Cognito sub of humans allowed to drive the agent"
+    prompt: "briefling allowed users"
+    password: false
