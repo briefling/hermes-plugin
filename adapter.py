@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -453,6 +453,23 @@ def voice_hint(files: Any) -> str:
     return ""
 
 
+# An edited message (↑ in the client, `message.edited` = hub time of the edit) comes again with the same id: the agent
+# must know it replaces the version it may already have, never a silent swap. The hub only accepts the edit when
+# nobody answered it, or when the agent's turn on it was stopped.
+EDIT_HINT = ("[The author edited this message: it replaces the version they sent earlier in this conversation. "
+             "If you had started answering that version, your turn was stopped; answer this version instead.]\n")
+
+
+def edit_hint(msg: Dict[str, Any]) -> str:
+    """Hidden note on an edited message (`edited` set by the hub)."""
+    return EDIT_HINT if isinstance(msg.get("edited"), int) and not isinstance(msg.get("edited"), bool) else ""
+
+
+def dedup_key(msg: Dict[str, Any], msg_id: str) -> str:
+    """Each edit of a message is a new input: deduplicated per (id, edit time), not per id alone."""
+    return f"{msg_id}@{msg['edited']}" if edit_hint(msg) else msg_id
+
+
 class BrieflingAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_TEXT
     supports_code_blocks = True
@@ -644,7 +661,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         thread, msg_id, text = frame.get("thread"), msg.get("id"), msg.get("text") or ""
         if not (isinstance(thread, str) and ID_RE.match(thread) and isinstance(msg_id, str) and text):
             return
-        if self._dedup.is_duplicate(msg_id):
+        if self._dedup.is_duplicate(dedup_key(msg, msg_id)):
             return
         self._titles[thread] = str((frame.get("context") or {}).get("title") or thread)
         if isinstance(frame.get("space"), str):
@@ -663,7 +680,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         # A gateway command (/approve, /stop...) must stay verbatim: prefixed with context it is no
         # longer a command and, during a turn, the gateway takes it as a redirect of the running run.
         if not MessageEvent(text=text).get_command():
-            text = with_context(frame.get("context") or {}, voice_hint(msg.get("files")) + text)
+            text = with_context(frame.get("context") or {}, edit_hint(msg) + voice_hint(msg.get("files")) + text)
         source = self.build_source(
             chat_id=thread, chat_name=self._titles[thread], chat_type="dm",
             user_id=str(author.get("id") or ""), user_name=str(frame.get("author_name") or author.get("id") or ""), message_id=msg_id)
