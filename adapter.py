@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -110,11 +110,12 @@ def approval_question(command: str, reason: str) -> str:
 
     What is approved must be what runs: the command is never reformatted, only cut when it exceeds the
     hub limit, and then the card says so. The fence is longer than any backtick run in the command, so
-    the command can't close it and turn its tail into Markdown.
+    the command can't close it and turn its tail into Markdown. The fence says `bash` so a client that
+    highlights code colours it as a shell command; the info string never reaches the displayed text.
     """
     fence = "`" * max(3, max((len(r) for r in re.findall(r"`+", command)), default=0) + 1)
     reason = " ".join(reason.split())[:300]
-    head, tail = f"Command to approve:\n{fence}\n", f"\n{fence}\nReason: {reason}"
+    head, tail = f"Command to approve:\n{fence}bash\n", f"\n{fence}\nReason: {reason}"
     budget = MAX_ASK - _u16(head) - _u16(tail)
     if _u16(command) <= budget:
         return head + command + tail
