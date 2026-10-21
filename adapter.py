@@ -9,6 +9,8 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
 - ``on_processing_start`` / ``on_processing_complete`` -> ``turn.started`` / ``turn.ended``; ``turn.ended`` carries the
   LLM spend of the thread since the previous turn end (``usage``), summed from the ``post_api_request`` and
   ``post_auxiliary_call`` hooks and priced with Hermes' ``estimate_usage_cost``.
+- hub ``turn.stop`` (Stop button) -> the gateway's ``/stop`` on that thread; the turn end then carries ``stopped``
+  and ``acted`` (a tool was called during the turn, ``pre_tool_call`` hook).
 - ``send`` / ``edit_message`` -> ``message.final`` (upsert by msg_id, streaming = successive edits)
 - ``send_clarify`` -> ``ask``; an ``answer`` delivered by the hub resolves the clarify.
 - exec approval -> ``ask`` with Approve / For this session / Always / Deny; the answer resolves the
@@ -69,7 +71,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -254,6 +256,31 @@ def on_post_auxiliary_call(**kw: Any) -> None:
         _record_usage(kw.get("response_model") or kw.get("model"), kw.get("usage"), kw.get("provider"), kw.get("base_url"))
     except Exception:
         logger.debug("briefling: post_auxiliary_call accounting failed", exc_info=True)
+
+
+# -- tools called during the turn (turn.ended.acted) ----------------------------------------------
+# ``pre_tool_call`` fires in the agent's threads (sub-agents included, same context vars): a stopped turn reports
+# whether the agent had already acted, since what a tool did stays done. Observer only: returns nothing, never raises.
+_acted_lock = threading.Lock()
+_acted: set = set()  # threads with at least one tool call since their turn started
+
+
+def on_pre_tool_call(**_: Any) -> None:
+    try:
+        thread = _usage_thread()
+        if thread:
+            with _acted_lock:
+                _acted.add(thread)
+    except Exception:
+        logger.debug("briefling: pre_tool_call tracking failed", exc_info=True)
+
+
+def take_acted(thread: str) -> bool:
+    with _acted_lock:
+        if thread in _acted:
+            _acted.discard(thread)
+            return True
+    return False
 
 
 def take_usage(thread: str) -> Optional[Dict[str, Any]]:
@@ -462,6 +489,10 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._sent_status: Dict[str, Optional[str]] = {}  # thread -> last status relayed (frame only on change)
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=600)
         self._opened = asyncio.Event()
+        self._turns: set = set()  # threads whose turn is running here (processing hooks)
+        self._stop_asked: Dict[str, str] = {}  # thread -> who asked the hub to stop its running turn
+        self._stop_ids: set = set()  # message ids of the synthetic /stop events: the gateway's reply to them is dropped
+        self._stop_tasks: set = set()
 
     # -- connection ----------------------------------------------------------
 
@@ -593,6 +624,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         logger.debug("[%s] frame %s %s", self.name, kind, (frame.get("message") or {}).get("type", ""))
         if kind == "deliver":
             await self._on_deliver(frame)
+        elif kind == "turn.stop":
+            self._on_stop(frame)
         elif kind == "subscribed":
             if frame.get("denied"):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
@@ -646,6 +679,30 @@ class BrieflingAdapter(BasePlatformAdapter):
             text=text.strip(), message_type=msg_type, source=source, message_id=msg_id, raw_message=frame, timestamp=ts,
             media_urls=media_urls, media_types=media_types))
 
+    def _on_stop(self, frame: Dict[str, Any]) -> None:
+        """Stop button (hub ``turn.stop``, trusted human already checked there): the gateway's own ``/stop``, which
+        interrupts the agent (a running terminal command is killed) and cancels the turn. Its turn end then carries
+        ``stopped`` + ``acted``. The gateway's « Stopped » reply is dropped: the hub posts « Stopped by <name> »."""
+        thread, by = frame.get("thread"), str(frame.get("by") or "")
+        if not (isinstance(thread, str) and ID_RE.match(thread)):
+            return
+        if by not in self._allowed_users:  # same second gate as approvals (deny if the allowlist is empty)
+            logger.warning("[%s] stop ignored: author not in BRIEFLING_ALLOWED_USERS", self.name)
+            return
+        if thread not in self._turns:
+            return  # the turn already ended: its turn.ended is on its way and clears the request
+        self._stop_asked[thread] = by
+        stop_id = f"stop-{new_id()}"
+        self._stop_ids.add(stop_id)
+        source = self.build_source(chat_id=thread, chat_name=self._titles.get(thread, thread), chat_type="dm",
+                                   user_id=by, user_name=by, message_id=stop_id)
+        event = MessageEvent(text="/stop", message_type=MessageType.TEXT, source=source, message_id=stop_id,
+                             timestamp=datetime.now(tz=timezone.utc))
+        # Own task: the gateway awaits the cancelled turn inside handle_message, the read loop must keep reading.
+        task = asyncio.ensure_future(self.handle_message(event))
+        self._stop_tasks.add(task)
+        task.add_done_callback(self._stop_tasks.discard)
+
     async def _download_files(self, files: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
         """Download attachments from their presigned S3 URLs into the Hermes media cache."""
         urls: List[str] = []
@@ -682,6 +739,9 @@ class BrieflingAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        if reply_to and reply_to in self._stop_ids:  # the gateway's reply to our /stop: the hub's line says it
+            self._stop_ids.discard(reply_to)
+            return SendResult(success=True, message_id=None)
         msg_id = new_id()
         ok = await self._send_frame({"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": content[:MAX_TEXT], "rev": self._next_rev()})
         return SendResult(success=ok, message_id=msg_id if ok else None, error=None if ok else "hub not connected")
@@ -893,13 +953,20 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         thread = getattr(event.source, "chat_id", None)
         if thread:
+            self._turns.add(thread)
+            self._stop_asked.pop(thread, None)
+            take_acted(thread)  # tools of an earlier turn don't count
             await self._send_frame({"type": "turn.started", "thread": thread, "at": self._turn_at(thread)})
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         thread = getattr(event.source, "chat_id", None)
         if thread:
+            self._turns.discard(thread)
             usage = take_usage(thread)
-            sent = await self._send_frame({"type": "turn.ended", "thread": thread, "at": self._turn_at(thread), **({"usage": usage} if usage else {})})
+            acted = take_acted(thread)
+            stop = {"stopped": True, "acted": acted} if self._stop_asked.pop(thread, None) else {}
+            sent = await self._send_frame({"type": "turn.ended", "thread": thread, "at": self._turn_at(thread),
+                                           **({"usage": usage} if usage else {}), **stop})
             if usage and not sent:
                 give_back_usage(thread, usage)
 
@@ -1210,3 +1277,4 @@ def register(ctx) -> None:
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("post_api_request", on_post_api_request)
         ctx.register_hook("post_auxiliary_call", on_post_auxiliary_call)
+        ctx.register_hook("pre_tool_call", on_pre_tool_call)  # turn.ended.acted after a stop
