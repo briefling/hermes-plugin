@@ -31,6 +31,8 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   end of the turn. Queued: the hub parks the thread; the agent ends its turn without ``turn_outcome`` and the hub
   resumes the thread with a new message once the resource is granted to it.
 - tool ``release_resource`` -> ``resource.release`` (``ack``): done with the resource, the next parked thread gets it.
+- tool ``pushed_commits`` -> ``ci.watch`` (``ack``): in a thread of a space with CI follow-up on, the agent declares the
+  commits it just pushed; the hub follows their CI on GitHub and shows the result in the thread.
 
 Config (env, or ``platforms.briefling.extra``): BRIEFLING_WS_URL, BRIEFLING_TOKEN_URL,
 BRIEFLING_CLIENT_ID, BRIEFLING_CLIENT_SECRET, BRIEFLING_SPACES (comma-separated, or ``*`` = every space
@@ -72,7 +74,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -372,6 +374,17 @@ ABOUT_ERRORS = {
     "forbidden": "Not allowed for this instance.",
     "bad_frame": f"Invalid draft (1-{MAX_ABOUT} chars, reason <= 500).",
 }
+CI_ERRORS = {
+    "not_thread": "Only in a thread, not in a Lounge topic.",
+    "no_turn": "Only during a turn triggered by a trusted human in this thread.",
+    "ci_off": "CI follow-up is off in this space (the admin turns it on in the space settings): nothing to declare.",
+    "repo_not_attached": "That repo is not attached to this space: only the repos listed in the message context are followed.",
+    "too_many": "Too many repos followed in this thread already.",
+    "forbidden": "Not allowed for this instance.",
+    "bad_frame": "Invalid commits: owner/name and the full 40-character sha of each pushed head, 5 at most.",
+}
+CI_MAX_COMMITS = 5  # protocol/frames.ts CI_MAX_COMMITS
+SHA_RE = re.compile(r"[0-9a-f]{40}")
 HUB_UNREACHABLE = {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
 
 
@@ -435,6 +448,10 @@ def with_context(context: Dict[str, Any], text: str) -> str:
     if repos:
         head += (f"[Work in this space starts from GitHub issues. Repos attached (propose_issue may propose an issue there, "
                  f"a human creates it): {', '.join(repos)}.]\n")
+    ci = [x for x in (context.get("ci") or []) if isinstance(x, str) and REPO_RE.fullmatch(x)]
+    if ci:
+        head += (f"[CI follow-up is on: after you push to {', '.join(ci)}, call pushed_commits with the repo and full sha "
+                 f"of each pushed head; briefling shows their CI result in this thread.]\n")
     if context.get("parallel") is True:
         head += ("[You may be working on other threads of this space at the same time: work in a git worktree "
                  "dedicated to this thread, never in a copy another thread uses.]\n")
@@ -925,6 +942,16 @@ class BrieflingAdapter(BasePlatformAdapter):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "detail": f"{resource} released."}
 
+    async def pushed_commits(self, thread: str, commits: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Declare pushed commits: the hub follows their CI (display only)."""
+        try:
+            await self._request({"type": "ci.watch", "thread": thread, "commits": commits})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": CI_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "detail": "CI followed: its result shows in this thread (up to one hour). Nothing else to do."}
+
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], file_name: Optional[str] = None) -> SendResult:
         fid = await self._upload(chat_id, path, file_name)
         if not fid:
@@ -1309,6 +1336,54 @@ def release_resource_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("release_resource", thread, lambda a: a.release_resource(thread, resource))
 
 
+PUSHED_SCHEMA = {
+    "name": "pushed_commits",
+    "description": (
+        "briefling only, in a thread of a space with CI follow-up on (the message context then lists the followed "
+        "repos): right after your last git push of the turn to one of those repos, declare the commit(s) you pushed "
+        "(the new head of each pushed branch). briefling reads their CI on GitHub (checks and commit statuses) and "
+        "shows the result in the thread for the humans. Declare only commits you pushed yourself in this thread; a new "
+        "commit for the same repo replaces the previous one. Do not wait for the CI result: end your turn as usual."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "commits": {
+                "type": "array", "maxItems": CI_MAX_COMMITS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string", "description": "owner/name, one of the followed repos listed in the message context."},
+                        "sha": {"type": "string", "description": "Full 40-character sha of the pushed commit (git rev-parse HEAD)."},
+                    },
+                    "required": ["repo", "sha"],
+                },
+            },
+        },
+        "required": ["commits"],
+    },
+}
+
+
+def pushed_commits_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: ci.watch (the hub checks the turn, the space switch and the repos)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("pushed_commits")
+    if err:
+        return tool_error(err)
+    raw = args.get("commits")
+    if not isinstance(raw, list) or not 1 <= len(raw) <= CI_MAX_COMMITS:
+        return tool_error(f"commits is required: 1 to {CI_MAX_COMMITS} items {{repo, sha}}.")
+    commits: List[Dict[str, str]] = []
+    for c in raw:
+        repo = str((c or {}).get("repo") or "").strip() if isinstance(c, dict) else ""
+        sha = str((c or {}).get("sha") or "").strip().lower() if isinstance(c, dict) else ""
+        if not REPO_RE.fullmatch(repo) or not SHA_RE.fullmatch(sha):
+            return tool_error("each commit needs repo (owner/name) and the full 40-character sha (git rev-parse HEAD).")
+        commits.append({"repo": repo, "sha": sha})
+    return _on_adapter("pushed_commits", thread, lambda a: a.pushed_commits(thread, commits))
+
+
 def _env_enablement() -> Optional[dict]:
     if not _get_scoped_secret("BRIEFLING_WS_URL", "").strip():
         return None
@@ -1353,6 +1428,8 @@ def register(ctx) -> None:
                           description=ACQUIRE_SCHEMA["description"], emoji="🔒")
         ctx.register_tool(name="release_resource", toolset="briefling", schema=RELEASE_SCHEMA, handler=release_resource_tool,
                           description=RELEASE_SCHEMA["description"], emoji="🔓")
+        ctx.register_tool(name="pushed_commits", toolset="briefling", schema=PUSHED_SCHEMA, handler=pushed_commits_tool,
+                          description=PUSHED_SCHEMA["description"], emoji="🚦")
     if hasattr(ctx, "register_cli_command"):  # `hermes briefling join <code-or-link>`
         from . import join
         ctx.register_cli_command(name="briefling", help="briefling hub: join with an agent invitation",
