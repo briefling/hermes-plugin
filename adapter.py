@@ -59,6 +59,7 @@ from collections import deque
 from datetime import datetime, timezone
 import mimetypes
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -74,6 +75,8 @@ from gateway.platforms.base import (
     BasePlatformAdapter, SendResult, cache_document_from_bytes_async, cache_image_from_bytes_async)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import MessageDeduplicator
+
+from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
 from gateway.platforms._shared import extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret
 
 logger = logging.getLogger(__name__)
@@ -81,7 +84,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.10"
+VERSION = "0.2.11"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -98,6 +101,13 @@ PING_EVERY_S = 300            # API Gateway closes idle connections after 10 min
 RECYCLE_AFTER_S = 110 * 60    # ... and every connection after 2 h: reconnect before
 TOKEN_MARGIN_S = 120
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+FLOW_TIMER_S = 30            # flow: how often the timer checks whether a host is due (poll_min)
+FLOW_MSG_PREFIX = "flow-"    # message id of a task turn's internal event
+FLOW_USER = "briefling-flow"
+FLOW_PREAMBLE = (
+    "[briefling] Board task, started by the flow (not by a human request). Work it with the board_* tools. In this "
+    "turn propose_issue, turn_outcome, acquire_resource, pushed_commits and the memory tools are refused: the board "
+    "status says how the task ends. A human may answer in this thread after your turn.\n\n")
 RESOURCE_RE = re.compile(r"[a-z][a-z0-9-]{0,23}(?::[a-z0-9][a-z0-9._-]{0,47})?")  # protocol/frames.ts RESOURCE_RE (fullmatch)
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -603,6 +613,12 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._stop_asked: Dict[str, str] = {}  # thread -> who asked the hub to stop its running turn
         self._stop_ids: set = set()  # message ids of the synthetic /stop events: the gateway's reply to them is dropped
         self._stop_tasks: set = set()
+        # Flow (docs/design-flow.md): board engine per (space, agent) listed in the settings file; ticks every poll_min.
+        self._flow_poll_min, self._flow_spaces = load_settings(_setting(extra, "flow", "BRIEFLING_FLOW"))
+        self._flow: Dict[str, FlowHost] = {}          # space -> host
+        self._flow_turns: Dict[str, FlowHost] = {}    # thread -> host whose task turn runs there
+        self._flow_ended: Dict[str, int] = {}         # thread -> end (s) of its last turn: the task's sign of life
+        self._flow_loop_task: Optional[asyncio.Task] = None
 
     # -- connection ----------------------------------------------------------
 
@@ -628,6 +644,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         _ADAPTERS.add(self)
         self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._run())
+        if self._flow_spaces:
+            self._start_flow()
         self._mark_connected()
         self._wire_plugin_handlers(None)
         return True
@@ -636,6 +654,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._running = False
         _ADAPTERS.discard(self)
         self._mark_disconnected()
+        if self._flow_loop_task:
+            self._flow_loop_task.cancel()
+            self._flow_loop_task = None
         if self._task:
             self._task.cancel()
             try:
@@ -739,7 +760,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         elif kind == "subscribed":
             if frame.get("denied"):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
-        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "memory.proposed", "memory.reviewed"):
+        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "memory.proposed", "memory.reviewed", "flow.result"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
                 fut.set_result(frame)
@@ -1150,6 +1171,83 @@ class BrieflingAdapter(BasePlatformAdapter):
                                            **({"usage": usage} if usage else {}), **stop})
             if usage and not sent:
                 give_back_usage(thread, usage)
+            self._flow_turn_ended(thread, str(getattr(event, "message_id", "") or ""), usage if sent else None)
+
+    # -- flow ------------------------------------------------------------------
+
+    def _start_flow(self) -> None:
+        from hermes_constants import get_hermes_home
+        state_dir = Path(get_hermes_home()) / "briefling-flow"
+        for fs in self._flow_spaces:
+            self._flow[fs.space] = FlowHost(fs, state_dir, self._flow_request, self._flow_inject(fs.space))
+        logger.info("[%s] flow on for %s (every %.0f min)", self.name, ",".join(self._flow), self._flow_poll_min)
+        self._flow_loop_task = asyncio.create_task(self._flow_loop())
+
+    async def _flow_loop(self) -> None:
+        """Timer: each host ticks every `poll_min` while the hub is reachable (degraded mode is a later slice)."""
+        while self._running:
+            try:
+                await self._opened.wait()
+                for host in list(self._flow.values()):
+                    # the config's limits.poll_min wins over the settings file (floor 1 min)
+                    if time.time() - host.last_tick >= max(1.0, host.poll_min or self._flow_poll_min) * 60:
+                        await self._flow_tick(host)
+                await asyncio.sleep(FLOW_TIMER_S)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.warning("[%s] flow timer error", self.name, exc_info=True)
+                await asyncio.sleep(FLOW_TIMER_S)
+
+    async def _flow_tick(self, host: "FlowHost") -> str:
+        thread = host.thread
+        alive = int(time.time()) if thread and thread in self._turns else self._flow_ended.get(thread or "")
+        try:
+            what = await host.tick(alive)
+        except Exception:
+            logger.warning("[%s] flow tick %s failed", self.name, host.fs.space, exc_info=True)
+            return "error"
+        logger.info("[%s] flow tick %s/%s: %s", self.name, host.fs.space, host.fs.agent, what)
+        return what
+
+    async def _flow_request(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return await self._request(frame)
+        except HubRefused as e:
+            raise HubAnswer(e.code) from e
+
+    def _flow_inject(self, space: str):
+        async def inject(thread: str, title: str, text: str) -> None:
+            """The task turn, in the issue thread's own session. Internal event: no human sent it (Hermes skips the
+            user allowlist for it and never lets it interrupt a running turn)."""
+            self._thread_space[thread] = space
+            self._titles[thread] = title
+            self._flow_turns[thread] = self._flow[space]
+            msg_id = f"{FLOW_MSG_PREFIX}{new_id()}"
+            source = self.build_source(chat_id=thread, chat_name=title, chat_type="dm", user_id=FLOW_USER,
+                                       user_name="briefling flow", message_id=msg_id)
+            await self.handle_message(MessageEvent(
+                text=FLOW_PREAMBLE + text, message_type=MessageType.TEXT, source=source, message_id=msg_id,
+                timestamp=datetime.now(tz=timezone.utc), internal=True))
+        return inject
+
+    def _flow_turn_ended(self, thread: str, msg_id: str, usage: Optional[Dict[str, Any]]) -> None:
+        """Spend tagged `task` (the flow's turn) or `discussion` (a human in a flow space); a task turn's end ticks
+        at once, so a closed task is seen without waiting for the timer."""
+        self._flow_ended[thread] = int(time.time())
+        host = self._flow_turns.get(thread) if msg_id.startswith(FLOW_MSG_PREFIX) else None
+        if host is not None:
+            self._flow_turns.pop(thread, None)
+            host.add_usage("task", usage)
+            host.turn_ended()
+            asyncio.ensure_future(self._flow_tick(host))
+            return
+        host = self._flow.get(self._thread_space.get(thread, ""))
+        if host is not None:
+            host.add_usage("discussion", usage)
+
+    def flow_host(self, thread: str) -> Optional["FlowHost"]:
+        return self._flow.get(self._thread_space.get(thread, ""))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": self._titles.get(chat_id, chat_id), "type": "dm"}
@@ -1617,6 +1715,100 @@ def memory_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("memory_propose", thread, lambda a: a.memory_propose(thread, text, kind, sources))
 
 
+BOARD_REF = {"type": "string", "description": "The board item, owner/repo#number (e.g. acme/app#80): one of your departments' repos."}
+BOARD_STATUS_SCHEMA = {
+    "name": "board_status",
+    "description": (
+        "briefling flow only, in a board-driven space: your status on a board item, written on GitHub as your one status "
+        "comment (edited in place). Call it with state='working' when you start a task, then ALWAYS end the task with "
+        "state='done' (with kind when the flow has kinds, and learned = '<rule> because <reason>' or 'none') or "
+        "state='blocked' (waiting for a human: say what in todo)."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "ref": BOARD_REF,
+        "state": {"type": "string", "enum": ["working", "done", "blocked"]},
+        "todo": {"type": "string", "description": "Next step (working) or what you need from a human (blocked)."},
+        "done": {"type": "string", "description": "What is done so far."},
+        "note": {"type": "string", "description": "Optional extra line."},
+        "kind": {"type": "string", "description": "Kind of work, required at done when the flow declares kinds."},
+        "learned": {"type": "string", "description": "Required at done: '<rule> because <reason>', or 'none'."},
+    }, "required": ["ref", "state"]},
+}
+BOARD_COMMENT_SCHEMA = {
+    "name": "board_comment",
+    "description": "briefling flow only: comment on a board item (GitHub issue) with your own identity. Repos may be public: no secrets.",
+    "parameters": {"type": "object", "properties": {"ref": BOARD_REF, "body": {"type": "string", "description": "GitHub Markdown."}},
+                   "required": ["ref", "body"]},
+}
+BOARD_MOVE_SCHEMA = {
+    "name": "board_move",
+    "description": "briefling flow only: move a board item to a state of its flow (the state key, e.g. 'doing', 'review').",
+    "parameters": {"type": "object", "properties": {
+        "ref": BOARD_REF, "state": {"type": "string", "description": "State key of the flow."},
+        "force": {"type": "boolean", "description": "Move to ready/doing although blocked: only if a human said so."},
+    }, "required": ["ref", "state"]},
+}
+BOARD_SET_SCHEMA = {
+    "name": "board_set",
+    "description": "briefling flow only: set a single-select field of a board item (e.g. field 'Size', value 'M').",
+    "parameters": {"type": "object", "properties": {"ref": BOARD_REF, "field": {"type": "string"}, "value": {"type": "string"}},
+                   "required": ["ref", "field", "value"]},
+}
+BOARD_LABEL_SCHEMA = {
+    "name": "board_label",
+    "description": "briefling flow only: add or remove labels on a board item. Assignment labels (role:agent) are set by humans only.",
+    "parameters": {"type": "object", "properties": {
+        "ref": BOARD_REF,
+        "add": {"type": "array", "items": {"type": "string"}}, "remove": {"type": "array", "items": {"type": "string"}},
+    }, "required": ["ref"]},
+}
+
+
+def _board_tool(tool: str, args: Dict[str, Any], call) -> str:
+    """Board tools run in the agent's Python thread (blocking GitHub calls), on the host of the conversation's space."""
+    from tools.registry import tool_error
+    thread, err = _session_thread(tool)
+    if err:
+        return tool_error(err)
+    host = next((h for a in list(_ADAPTERS) for h in [a.flow_host(thread)] if h is not None), None)
+    if host is None:
+        return tool_error(f"{tool} only works in a thread of a space whose board this agent works (flow).")
+    ref = str(args.get("ref") or "").strip()
+    try:
+        return json.dumps({"ok": True, "result": call(host, ref)}, ensure_ascii=False)
+    except FlowError as e:
+        return tool_error(str(e))
+    except Exception as e:  # GitHub / config errors: the agent sees the cause, never a token
+        logger.warning("%s failed: %s", tool, type(e).__name__)
+        return tool_error(f"{tool} failed: {type(e).__name__}: {str(e)[:300]}")
+
+
+def board_status_tool(args: Dict[str, Any], **_: Any) -> str:
+    return _board_tool("board_status", args, lambda h, ref: h.board_status(
+        ref, str(args.get("state") or ""), todo=str(args.get("todo") or ""), done=str(args.get("done") or ""),
+        note=str(args.get("note") or ""), kind=str(args.get("kind") or ""), learned=str(args.get("learned") or "")))
+
+
+def board_comment_tool(args: Dict[str, Any], **_: Any) -> str:
+    return _board_tool("board_comment", args, lambda h, ref: h.board_comment(ref, str(args.get("body") or "")))
+
+
+def board_move_tool(args: Dict[str, Any], **_: Any) -> str:
+    return _board_tool("board_move", args, lambda h, ref: h.board_move(ref, str(args.get("state") or ""), bool(args.get("force"))))
+
+
+def board_set_tool(args: Dict[str, Any], **_: Any) -> str:
+    return _board_tool("board_set", args, lambda h, ref: h.board_set(ref, str(args.get("field") or ""), str(args.get("value") or "")))
+
+
+def _labels(x: Any) -> List[str]:
+    return [str(v).strip() for v in (x if isinstance(x, list) else []) if str(v).strip()][:20]
+
+
+def board_label_tool(args: Dict[str, Any], **_: Any) -> str:
+    return _board_tool("board_label", args, lambda h, ref: h.board_label(ref, _labels(args.get("add")), _labels(args.get("remove"))))
+
+
 def _env_enablement() -> Optional[dict]:
     if not _get_scoped_secret("BRIEFLING_WS_URL", "").strip():
         return None
@@ -1671,6 +1863,11 @@ def register(ctx) -> None:
                           description=MEMORY_PROPOSE_SCHEMA["description"], emoji="🧠")
         ctx.register_tool(name="memory_review", toolset="briefling", schema=MEMORY_REVIEW_SCHEMA, handler=memory_review_tool,
                           description=MEMORY_REVIEW_SCHEMA["description"], emoji="🧠")
+        for schema, handler in ((BOARD_STATUS_SCHEMA, board_status_tool), (BOARD_COMMENT_SCHEMA, board_comment_tool),
+                                (BOARD_MOVE_SCHEMA, board_move_tool), (BOARD_LABEL_SCHEMA, board_label_tool),
+                                (BOARD_SET_SCHEMA, board_set_tool)):
+            ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
+                              description=schema["description"], emoji="📋")
     if hasattr(ctx, "register_cli_command"):  # `hermes briefling join <code-or-link>`
         from . import join
         ctx.register_cli_command(name="briefling", help="briefling hub: join with an agent invitation",
