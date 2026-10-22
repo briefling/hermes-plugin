@@ -46,6 +46,7 @@ import secrets
 import threading
 import time
 import weakref
+from collections import deque
 from datetime import datetime, timezone
 import mimetypes
 import os
@@ -71,12 +72,13 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
 MAX_BRIEF = 1500  # protocol/frames.ts MAX_BRIEF
 MAX_STATUS = 200  # protocol/frames.ts MAX_STATUS
+MAX_ACTIVITY = 10  # protocol/frames.ts MAX_ACTIVITY (status.recent)
 MAX_ACTION = 200  # protocol/frames.ts MAX_ACTION
 MAX_ABOUT = 4000  # protocol/frames.ts MAX_ABOUT (space description, admin-written)
 NEW_ISSUE_TITLE_MAX = 256  # protocol/frames.ts NEW_ISSUE_TITLE_MAX (GitHub's limit)
@@ -240,7 +242,29 @@ def _record_usage(model: Any, usage: Any, provider: Any, base_url: Any) -> None:
         _usage[thread] = add_usage(_usage.get(thread), call)
 
 
+# -- model calls of the running turn (status.steps, shown as « N steps » in the working line) -------------------
+_steps_lock = threading.Lock()
+_steps: Dict[str, int] = {}  # thread -> model calls since its turn started (sub-agents included)
+
+
+def steps_of(thread: str) -> int:
+    with _steps_lock:
+        return _steps.get(thread, 0)
+
+
+def reset_steps(thread: str) -> None:
+    with _steps_lock:
+        _steps.pop(thread, None)
+
+
 def on_post_api_request(**kw: Any) -> None:
+    try:
+        thread = _usage_thread()
+        if thread:
+            with _steps_lock:
+                _steps[thread] = _steps.get(thread, 0) + 1
+    except Exception:
+        logger.debug("briefling: post_api_request step count failed", exc_info=True)
     try:
         # agent.model, like Hermes' session pricing (response_model can be a dated alias with no price entry)
         _record_usage(kw.get("model"), kw.get("usage"), kw.get("provider"), kw.get("base_url"))
@@ -465,6 +489,21 @@ def edit_hint(msg: Dict[str, Any]) -> str:
     return EDIT_HINT if isinstance(msg.get("edited"), int) and not isinstance(msg.get("edited"), bool) else ""
 
 
+def safe_status(text: Optional[str]) -> Optional[str]:
+    """Tool phrase as members may see it: secrets masked (a terminal preview is the raw command line: an
+    `AWS_SECRET_ACCESS_KEY=…` or a `user:password@` URL would show), cut to MAX_STATUS. Fails closed."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        from agent.redact import redact_sensitive_text
+        text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
+    except Exception:
+        logger.debug("briefling: status redaction unavailable, phrase dropped", exc_info=True)
+        return None
+    return text.strip()[:MAX_STATUS] or None
+
+
 def dedup_key(msg: Dict[str, Any], msg_id: str) -> str:
     """Each edit of a message is a new input: deduplicated per (id, edit time), not per id alone."""
     return f"{msg_id}@{msg['edited']}" if edit_hint(msg) else msg_id
@@ -503,7 +542,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_turn_at: Dict[str, int] = {}
         self._rev = 0  # global and increasing: orders the edits of a message (hub drops older ones)
-        self._sent_status: Dict[str, Optional[str]] = {}  # thread -> last status relayed (frame only on change)
+        self._sent_status: Dict[str, tuple] = {}  # thread -> last (text, steps, recent) relayed (frame only on change)
+        self._activity: Dict[str, deque] = {}  # thread -> last tool phrases of the running turn (status.recent)
+        self._turn_since: Dict[str, int] = {}  # thread -> turn start (ms), status.since
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=600)
         self._opened = asyncio.Event()
         self._turns: set = set()  # threads whose turn is running here (processing hooks)
@@ -946,16 +987,37 @@ class BrieflingAdapter(BasePlatformAdapter):
         if not resolve_gateway_approval(session_key, choice):
             await self.send(thread, "Too late: this approval request expired, the command was not run.")
 
+    def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
+        # Called by the gateway at each tool start (None in between), from the agent's worker thread: the phrase
+        # is masked here, so neither the line nor the feed ever holds a raw secret. Every tool lands in the feed,
+        # even one shorter than the ~2 s typing refresh that relays the line.
+        safe = safe_status(text)
+        super().set_status_text(chat_id, safe)
+        if safe:
+            feed = self._activity.setdefault(str(chat_id), deque(maxlen=MAX_ACTIVITY))
+            if not feed or feed[-1] != safe:
+                feed.append(safe)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         text = (getattr(self, "_status_text", {}).get(str(chat_id)) or "").strip()[:MAX_STATUS] or None
-        if self._sent_status.get(chat_id) == text:
+        steps, recent = steps_of(chat_id), list(self._activity.get(chat_id, ()))
+        key = (text, steps, tuple(recent))
+        if self._sent_status.get(chat_id, (None, 0, ())) == key:
             return
-        self._sent_status[chat_id] = text
-        await self._send_frame({"type": "status", "thread": chat_id, "text": text, "rev": self._next_rev()})
+        self._sent_status[chat_id] = key
+        since = self._turn_since.get(chat_id)
+        await self._send_frame({"type": "status", "thread": chat_id, "text": text, "rev": self._next_rev(),
+                                **({"since": since} if since else {}), **({"steps": steps} if steps else {}),
+                                **({"recent": recent} if recent else {})})
 
     async def stop_typing(self, chat_id: str) -> None:
         # No frame: the turn end clears the line on the client (and the hub refuses status out of a turn).
         self._sent_status.pop(chat_id, None)
+
+    def _reset_progress(self, thread: str) -> None:
+        self._activity.pop(thread, None)
+        self._turn_since.pop(thread, None)
+        reset_steps(thread)
 
     def _next_rev(self) -> int:
         # ms timestamp keeps increasing across gateway restarts, unlike a bare counter
@@ -973,12 +1035,15 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._turns.add(thread)
             self._stop_asked.pop(thread, None)
             take_acted(thread)  # tools of an earlier turn don't count
+            self._reset_progress(thread)
+            self._turn_since[thread] = int(time.time() * 1000)
             await self._send_frame({"type": "turn.started", "thread": thread, "at": self._turn_at(thread)})
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         thread = getattr(event.source, "chat_id", None)
         if thread:
             self._turns.discard(thread)
+            self._reset_progress(thread)
             usage = take_usage(thread)
             acted = take_acted(thread)
             stop = {"stopped": True, "acted": acted} if self._stop_asked.pop(thread, None) else {}
@@ -1267,9 +1332,11 @@ def register(ctx) -> None:
         ),
     )
     # Tool progress lives in the client's "X is working…" line (status frames), not in chat bubbles that
-    # would be stored in the thread. A profile can still opt back in (display.platforms.briefling.tool_progress).
+    # would be stored in the thread. Same for the gateway's « ⏳ Working — N min — iteration K » heartbeat: the line
+    # shows the elapsed time and step count (status.since/steps). A profile can still opt back in
+    # (display.platforms.briefling.tool_progress / long_running_notifications).
     try:
-        ctx.register_platform(**kw, display_overrides={"tool_progress": "off"})
+        ctx.register_platform(**kw, display_overrides={"tool_progress": "off", "long_running_notifications": False})
     except TypeError:  # older Hermes without per-platform display defaults
         ctx.register_platform(**kw)
     # Toolset "briefling": part of the implicit hermes-briefling bundle, so only briefling sessions see it.
