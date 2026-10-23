@@ -77,6 +77,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import MessageDeduplicator
 
 from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
+from .flowswitch import SwitchError, parse_link
 from gateway.platforms._shared import extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.15"
+VERSION = "0.2.16"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -779,12 +780,17 @@ class BrieflingAdapter(BasePlatformAdapter):
             await self._on_flow_pause(frame)
         elif kind == "flow.wake":
             self._on_flow_wake(frame)
+        elif kind == "flow.pilot":
+            await self._on_flow_pilot(frame)
         elif kind == "subscribed":
+            for host in list(self._flow.values()):   # a new connection: nobody pilots until the hub's flow.pilot says so
+                host.piloted = False
             if frame.get("denied"):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
-            for host in list(self._flow.values()):   # the hub may hold an old state: report it again
+            for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
-        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "memory.proposed", "memory.reviewed", "flow.result"):
+        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "memory.proposed", "memory.reviewed", "flow.result",
+                      "flow.switched"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
                 fut.set_result(frame)
@@ -1233,7 +1239,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                 await self._opened.wait()
                 for host in list(self._flow.values()):
                     # the config's limits.poll_min wins over the settings file (floor 1 min)
-                    if time.time() - host.last_tick >= max(1.0, host.poll_min or self._flow_poll_min) * 60:
+                    if getattr(host, "piloted", False) and time.time() - host.last_tick >= max(1.0, host.poll_min or self._flow_poll_min) * 60:
                         await self._flow_tick(host)
                 await asyncio.sleep(FLOW_TIMER_S)
             except asyncio.CancelledError:
@@ -1243,6 +1249,8 @@ class BrieflingAdapter(BasePlatformAdapter):
                 await asyncio.sleep(FLOW_TIMER_S)
 
     async def _flow_tick(self, host: "FlowHost") -> str:
+        if not getattr(host, "piloted", False):   # unstrikeable (or nobody) pilots this agent: no tick, no report
+            return "not piloted"
         thread = host.thread
         alive = int(time.time()) if thread and thread in self._turns else self._flow_ended.get(thread or "")
         try:
@@ -1257,7 +1265,7 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def _flow_report(self, host: "FlowHost", force: bool = False) -> None:
         """`flow.state` to the hub when what it shows changed (pause, task, spend, caps, alerts), or `force`."""
         snap = getattr(host, "snapshot", None)
-        if snap is None:
+        if snap is None or not getattr(host, "piloted", False):
             return
         thread = host.thread
         running = bool(thread and (getattr(host, "task_turn", False) or thread in self._turns))
@@ -1285,12 +1293,49 @@ class BrieflingAdapter(BasePlatformAdapter):
     def _on_flow_wake(self, frame: Dict[str, Any]) -> None:
         """« Read the board now »: a normal tick, unless the host ticked less than FLOW_WAKE_MIN_S ago."""
         host = self._flow.get(str(frame.get("space") or ""))
-        if host is None:
+        if host is None or not getattr(host, "piloted", False):
             return
         if time.time() - host.last_tick < FLOW_WAKE_MIN_S:
             logger.debug("[%s] flow wake %s skipped: ticked %.0f s ago", self.name, host.fs.space, time.time() - host.last_tick)
             return
         asyncio.ensure_future(self._flow_tick(host))
+
+    async def _on_flow_pilot(self, frame: Dict[str, Any]) -> None:
+        """Who pilots this machine's agent in the space (§ 13): true = tick, report, ask tasks; false = stop, and
+        after a switch write the engine state back to unstrikeable's file (« Back to unstrikeable »)."""
+        host = self._flow.get(str(frame.get("space") or ""))
+        piloted = frame.get("piloted")
+        if host is None or frame.get("agent") != host.fs.agent or not isinstance(piloted, bool):
+            return
+        was, host.piloted = host.piloted, piloted
+        if piloted != was:
+            logger.info("[%s] flow %s/%s %s", self.name, host.fs.space, host.fs.agent,
+                        "piloted by briefling" if piloted else "not piloted by briefling")
+        if piloted:
+            await self._flow_report(host, force=True)
+            self._on_flow_wake({"space": host.fs.space})
+        elif isinstance(host.state.get("switched"), dict):
+            await host.switch_back()
+
+    async def flow_switch(self, link: str) -> Dict[str, Any]:
+        """`flow_switch` tool, on the gateway loop: redeem a switch link for the host of (space, agent)."""
+        try:
+            code, space, agent = parse_link(link)
+        except SwitchError as e:
+            return {"error": str(e)}
+        host = self._flow.get(space)
+        if host is None or host.fs.agent != agent:
+            return {"error": "this gateway runs no flow for %s in %s: add a BRIEFLING_FLOW entry for (space %s, agent %s) "
+                             "with its identity and uns_state, then restart the gateway" % (agent, space, space, agent)}
+        if not self._opened.is_set():
+            return {"error": "briefling hub not connected: retry when connected"}
+        try:
+            out = await host.switch(code)
+        except SwitchError as e:
+            return {"error": str(e)}
+        await self._flow_report(host, force=True)
+        asyncio.ensure_future(self._flow_tick(host))
+        return out
 
     async def _on_flow_config(self, frame: Dict[str, Any]) -> None:
         """The space's flow config from the hub's editor: loaded by the host of that space (its agent), answered with
@@ -1916,6 +1961,48 @@ def board_label_tool(args: Dict[str, Any], **_: Any) -> str:
     return _board_tool("board_label", args, lambda h, ref: h.board_label(ref, _labels(args.get("add")), _labels(args.get("remove"))))
 
 
+FLOW_SWITCH_SCHEMA = {
+    "name": "flow_switch",
+    "description": (
+        "briefling only: switch your board work in a space from unstrikeable to briefling, with the link an admin "
+        "gave you. Imports your unstrikeable state, pauses it, and briefling pilots from then on. Afterwards, remove "
+        "your uns_poll cron job."),
+    "parameters": {"type": "object", "properties": {
+        "link": {"type": "string", "description": "The whole switch link (…/agent.md?switch=…&space=…&agent=…)."},
+    }, "required": ["link"]},
+}
+
+
+def flow_switch_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Runs in the agent's Python thread: the adapter serving the link's (space, agent) does the switch on its loop."""
+    from tools.registry import tool_error
+    _, err = _session_thread("flow_switch")
+    if err:
+        return tool_error(err)
+    link = str(args.get("link") or "")
+    try:
+        _, space, agent = parse_link(link)
+    except SwitchError as e:
+        return tool_error(str(e))
+    adapter = next((a for a in list(_ADAPTERS) if getattr(a._flow.get(space), "fs", None) is not None
+                    and a._flow[space].fs.agent == agent), None) or next(iter(list(_ADAPTERS)), None)
+    if adapter is None or adapter._loop is None:
+        return tool_error("briefling is not connected.")
+    try:
+        if asyncio.get_running_loop() is adapter._loop:
+            return tool_error("flow_switch cannot run on the gateway loop.")
+    except RuntimeError:
+        pass
+    try:
+        out = asyncio.run_coroutine_threadsafe(adapter.flow_switch(link), adapter._loop).result(timeout=40)
+    except Exception as e:  # timeout: the switch may still finish; running it again with the same link is safe
+        logger.warning("flow_switch failed: %s", type(e).__name__)
+        return tool_error("flow_switch did not finish (%s): run it again with the same link" % type(e).__name__)
+    if out.get("error"):
+        return tool_error(out["error"])
+    return json.dumps(out, ensure_ascii=False)
+
+
 def _env_enablement() -> Optional[dict]:
     if not _get_scoped_secret("BRIEFLING_WS_URL", "").strip():
         return None
@@ -1975,6 +2062,8 @@ def register(ctx) -> None:
                                 (BOARD_SET_SCHEMA, board_set_tool)):
             ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
                               description=schema["description"], emoji="📋")
+        ctx.register_tool(name="flow_switch", toolset="briefling", schema=FLOW_SWITCH_SCHEMA, handler=flow_switch_tool,
+                          description=FLOW_SWITCH_SCHEMA["description"], emoji="🔀")
     if hasattr(ctx, "register_cli_command"):  # `hermes briefling join <code-or-link>`
         from . import join
         ctx.register_cli_command(name="briefling", help="briefling hub: join with an agent invitation",

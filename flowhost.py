@@ -7,12 +7,18 @@ closed task goes back to the hub (``flow.done``). The board says what to do, the
 Settings: a JSON file (``BRIEFLING_FLOW`` / extra ``flow``), read at start::
 
     {"poll_min": 5, "spaces": [{"space": "sandbox", "agent": "kevin", "config": "/path/to/hq-clone",
-      "identity": {"app_id": 123, "app_key": "/path/key.pem", "installation_id": 456}}]}
+      "identity": {"app_id": 123, "app_key": "/path/key.pem", "installation_id": 456},
+      "uns_state": "~/.unstrikeable/state/poll-kevin.json"}]}
 
 The company config bundle (``config.yml``, ``culture.md``, ``agents/``, ``flows/``, ``playbooks/``) comes from the hub's
 flow editor (``flow.config``, see ``flowconfig.py``): the last good one it pushed is in use. ``config`` = an optional
 local folder used until the hub has pushed one (spaces without a config in briefling). ``identity`` = the agent's GitHub
-App (its key stays on this machine, never in the bundle); missing = this machine's ``gh`` login.
+App (its key stays on this machine, never in the bundle); missing = this machine's ``gh`` login. ``uns_state`` =
+unstrikeable's ``poll-<agent>.json`` as this gateway sees it, for « switch by link » (``flowswitch.py``); missing =
+``$UNS_HOME/state/`` else ``~/.unstrikeable/state/``.
+
+Pilot (docs/design-flow.md § 13): the host ticks, reports and asks tasks only while the hub's last ``flow.pilot`` said
+true (``piloted``, memory only, false at each new connection until the hub says otherwise).
 """
 from __future__ import annotations
 
@@ -27,6 +33,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .flow.config import Company, ConfigError, Department, load_company
 from .flowconfig import ConfigStore
+from . import flowswitch
+from .flowswitch import SwitchError
 from .flow.backends.github import GitHubBoard
 from .flow.identity import make_token
 from .flow.model import AGENT_MARK
@@ -64,6 +72,7 @@ class FlowSpace:
     agent: str
     config: Optional[Path] = None     # local fallback until the hub pushes a bundle
     identity: Dict[str, Any] = field(default_factory=dict)
+    uns_state: Optional[Path] = None  # unstrikeable's poll-<agent>.json (switch by link); None = default place
 
 
 def load_settings(path: str) -> tuple[float, List[FlowSpace]]:
@@ -75,7 +84,13 @@ def load_settings(path: str) -> tuple[float, List[FlowSpace]]:
         poll_min = max(MIN_POLL_MIN, float(raw.get("poll_min") or DEFAULT_POLL_MIN))
         spaces = [FlowSpace(space=str(s["space"]), agent=str(s["agent"]),
                             config=Path(os.path.expanduser(str(s["config"]))) if s.get("config") else None,
-                            identity=dict(s.get("identity") or {})) for s in raw.get("spaces") or []]
+                            identity=dict(s.get("identity") or {}),
+                            uns_state=Path(os.path.expanduser(str(s["uns_state"]))) if s.get("uns_state") else None)
+                  for s in raw.get("spaces") or []]
+        for fs in spaces:   # kept (the flow still runs), refused at switch time with the same message
+            if fs.uns_state is not None and fs.uns_state.name != flowswitch.state_name(fs.agent):
+                logger.warning("briefling flow settings: uns_state of %s/%s must be named %s", fs.space, fs.agent,
+                               flowswitch.state_name(fs.agent))
         return poll_min, spaces
     except (OSError, ValueError, KeyError, TypeError) as e:
         logger.warning("briefling flow settings %s unreadable: %s", path, type(e).__name__)
@@ -132,6 +147,7 @@ class FlowHost:
         self.poll_min: Optional[float] = None  # the agent's `limits.poll_min` in the config, read at each tick
         self.caps: Dict[str, Optional[float]] = {"day": None, "month": None}  # cost caps of the config, read at each tick
         self.reported: Optional[Dict[str, Any]] = None  # last `flow.state` the hub accepted (sent again only on change)
+        self.piloted = False              # the hub's last `flow.pilot` for this agent (memory only, § 13)
 
     # -- state -----------------------------------------------------------------
     def _load(self) -> Dict[str, Any]:
@@ -255,6 +271,8 @@ class FlowHost:
         if self.task_turn or self.lock.locked():
             return "busy"
         async with self.lock:
+            if not self.piloted:               # second gate: unstrikeable (or nobody) pilots this agent
+                return "not piloted"
             self.last_tick = self._clock()
             await self._flush()
             if self.state.get("pending"):
@@ -338,6 +356,86 @@ class FlowHost:
                 return
             self.state["outbox"].pop(0)
             self.save()
+
+    # -- switch by link (docs/design-flow.md § 13) ---------------------------------
+    async def switch(self, code: str) -> Dict[str, Any]:
+        """Import unstrikeable's state of this agent, pause it, redeem the code at the hub; accepted = piloted.
+        Raises SwitchError (nothing changed, the file restored when we had paused it)."""
+        async with self.lock:
+            path = flowswitch.uns_state_path(self.fs.agent, self.fs.uns_state)
+            now = int(self._clock())
+            original, raw = await asyncio.to_thread(flowswitch.read_state, path)
+            imp = flowswitch.extract(raw, now)
+            cur = raw.get("current")
+            if cur is not None and not isinstance(cur, dict):
+                raise SwitchError("unstrikeable's state file is malformed (current): nothing was changed")
+            if cur:
+                raise SwitchError("a task is in progress in unstrikeable (%s): let it finish (uns closes it at its "
+                                  "next poll), then retry" % str(cur.get("ref") or "?")[:200])
+            rewrote = not flowswitch.paused_by_briefling(raw)   # already paused by us: a lost answer, redeem again
+            if rewrote:
+                try:
+                    await asyncio.to_thread(flowswitch.write_atomic, path, flowswitch.pause_text(raw, now))
+                except OSError as e:
+                    raise SwitchError("cannot pause unstrikeable's state file %s: %s" % (path, type(e).__name__))
+            imported = flowswitch.counters(imp)
+            frame = {"type": "flow.switch", "space": self.fs.space, "agent": self.fs.agent, "code": code,
+                     "imported": imported}
+            try:
+                await self._request(frame)
+            except (HubAnswer, ConnectionError) as e:   # refused or never sent: unstrikeable goes on as before
+                if rewrote:
+                    await self._restore(path, original)
+                code_ = str(e)
+                if isinstance(e, HubAnswer) and code_ == "bad_code":
+                    raise SwitchError("link unknown, used or expired: ask an admin for a new one")
+                raise SwitchError("switch refused by the hub: %s" % code_ if isinstance(e, HubAnswer)
+                                  else "briefling hub not reachable: retry when connected")
+            except asyncio.TimeoutError:   # the hub may have taken it: keep the pause, a retry redeems again
+                raise SwitchError("no answer from the hub: unstrikeable stays paused; run flow_switch again with "
+                                  "the same link")
+            added = flowswitch.merge(self.engine, imp, now)
+            # the Board block's today / 30-day spend reads the ledger: unstrikeable's board spend counts as task
+            self.state["ledger"] = [e for e in self.state.get("ledger") or [] if e[0] >= now - MONTH_S] + \
+                [[int(t), "task", round(float(c), 6)] for t, c in added]
+            self.state["switched"] = {"from": str(path), "at": now}
+            self.save()
+            self.piloted = True
+            logger.info("briefling flow %s/%s switched from unstrikeable (%s): %s", self.fs.space, self.fs.agent,
+                        path, imported)
+            return {"ok": True, "space": self.fs.space, "agent": self.fs.agent, "imported": imported,
+                    "state_file": str(path), "paused": True, "next": "remove your uns_poll cron job if not done yet"}
+
+    async def _restore(self, path: Path, original: bytes) -> None:
+        try:
+            await asyncio.to_thread(flowswitch.write_atomic, path, original)
+        except OSError as e:
+            logger.warning("briefling flow %s/%s: unstrikeable's state %s not restored: %s", self.fs.space,
+                           self.fs.agent, path, type(e).__name__)
+
+    async def switch_back(self) -> bool:
+        """« Back to unstrikeable » (`flow.pilot false` after a switch): the engine state goes back to the file it
+        came from, without briefling's pause. Returns whether it was written; a failure keeps `switched`."""
+        async with self.lock:
+            sw = self.state.get("switched")
+            if not isinstance(sw, dict) or not sw.get("from"):
+                return False
+            path = Path(str(sw["from"]))
+            if path.name != flowswitch.state_name(self.fs.agent):
+                logger.warning("briefling flow %s/%s: switched.from %s is not a %s file, not written back",
+                               self.fs.space, self.fs.agent, path, flowswitch.state_name(self.fs.agent))
+                return False
+            try:
+                await asyncio.to_thread(flowswitch.write_atomic, path, flowswitch.back_text(self.engine))
+            except OSError as e:
+                logger.warning("briefling flow %s/%s: state not written back to %s: %s", self.fs.space, self.fs.agent,
+                               path, type(e).__name__)
+                return False
+            self.state.pop("switched", None)
+            self.save()
+            logger.info("briefling flow %s/%s: back to unstrikeable, state written to %s", self.fs.space,
+                        self.fs.agent, path)
+            return True
 
     # -- board tools (agent's own identity, its departments' repos only) -----------
     def _target(self, ref: str):
