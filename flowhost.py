@@ -9,9 +9,10 @@ Settings: a JSON file (``BRIEFLING_FLOW`` / extra ``flow``), read at start::
     {"poll_min": 5, "spaces": [{"space": "sandbox", "agent": "kevin", "config": "/path/to/hq-clone",
       "identity": {"app_id": 123, "app_key": "/path/key.pem", "installation_id": 456}}]}
 
-``config`` = a local folder holding the company config bundle (``config.yml``, ``culture.md``, ``agents/``,
-``playbooks/``): the config editor of the hub comes in a later slice. ``identity`` = the agent's GitHub App (its key
-stays on this machine); missing = this machine's ``gh`` login.
+The company config bundle (``config.yml``, ``culture.md``, ``agents/``, ``flows/``, ``playbooks/``) comes from the hub's
+flow editor (``flow.config``, see ``flowconfig.py``): the last good one it pushed is in use. ``config`` = an optional
+local folder used until the hub has pushed one (spaces without a config in briefling). ``identity`` = the agent's GitHub
+App (its key stays on this machine, never in the bundle); missing = this machine's ``gh`` login.
 """
 from __future__ import annotations
 
@@ -24,7 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from .flow.config import Company, Department, load_company
+from .flow.config import Company, ConfigError, Department, load_company
+from .flowconfig import ConfigStore
 from .flow.backends.github import GitHubBoard
 from .flow.identity import make_token
 from .flow.model import AGENT_MARK
@@ -52,7 +54,7 @@ class FlowError(Exception):
 class FlowSpace:
     space: str
     agent: str
-    config: Path
+    config: Optional[Path] = None     # local fallback until the hub pushes a bundle
     identity: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -63,7 +65,8 @@ def load_settings(path: str) -> tuple[float, List[FlowSpace]]:
     try:
         raw = json.loads(Path(os.path.expanduser(path)).read_text())
         poll_min = max(MIN_POLL_MIN, float(raw.get("poll_min") or DEFAULT_POLL_MIN))
-        spaces = [FlowSpace(space=str(s["space"]), agent=str(s["agent"]), config=Path(os.path.expanduser(str(s["config"]))),
+        spaces = [FlowSpace(space=str(s["space"]), agent=str(s["agent"]),
+                            config=Path(os.path.expanduser(str(s["config"]))) if s.get("config") else None,
                             identity=dict(s.get("identity") or {})) for s in raw.get("spaces") or []]
         return poll_min, spaces
     except (OSError, ValueError, KeyError, TypeError) as e:
@@ -111,7 +114,9 @@ class FlowHost:
         self.token_dir = state_dir
         self._request, self._inject, self._clock = request, inject, clock
         self._make_board = make_board or self._github_board
-        self._company = company or (lambda: load_company(self.fs.config))
+        self.configs = ConfigStore(state_dir / "config" / fs.space)
+        self._company_default = company is None
+        self._company = company or (lambda: load_company(self.config_dir()))
         self.state: Dict[str, Any] = self._load()
         self.lock = asyncio.Lock()
         self.task_turn = False            # a task turn of this host is running (no tick meanwhile)
@@ -153,6 +158,23 @@ class FlowHost:
         c[tag] = add_counters(c.get(tag) or ZERO, to_counters(turn_usage))
         self.save()
 
+    # -- config ----------------------------------------------------------------
+    def config_dir(self) -> Path:
+        """The hub's last good bundle, else the local folder of the settings."""
+        cur = self.configs.current()
+        if cur:
+            return cur["dir"]
+        if self.fs.config is None:
+            raise ConfigError("no flow config yet (none pushed by the hub, no local folder)")
+        return self.fs.config
+
+    def has_config(self) -> bool:
+        return self.fs.config is not None or self.configs.current() is not None
+
+    def apply_config(self, version: int, sha: str, files: Any) -> tuple:
+        """A bundle pushed by the hub: (ok, error). Refused = the previous one stays in use."""
+        return self.configs.apply(version, sha, files)
+
     # -- GitHub ----------------------------------------------------------------
     def company(self) -> Company:
         return self._company()
@@ -180,6 +202,8 @@ class FlowHost:
             await self._flush()
             if self.state.get("pending"):
                 return await self._start()
+            if self._company_default and not self.has_config():
+                return "no_config"
             out = await asyncio.to_thread(self._poll, alive)
             finished = self.engine.pop("finished", None) or []
             self.save()

@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.12"
+VERSION = "0.2.13"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -626,6 +626,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._flow_turns: Dict[str, FlowHost] = {}    # thread -> host whose task turn runs there
         self._flow_ended: Dict[str, int] = {}         # thread -> end (s) of its last turn: the task's sign of life
         self._flow_loop_task: Optional[asyncio.Task] = None
+        self._flow_config_lock = asyncio.Lock()       # one bundle written at a time
 
     # -- connection ----------------------------------------------------------
 
@@ -764,6 +765,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             await self._on_deliver(frame)
         elif kind == "turn.stop":
             self._on_stop(frame)
+        elif kind == "flow.config":
+            await self._on_flow_config(frame)
         elif kind == "subscribed":
             if frame.get("denied"):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
@@ -1218,6 +1221,27 @@ class BrieflingAdapter(BasePlatformAdapter):
             return "error"
         logger.info("[%s] flow tick %s/%s: %s", self.name, host.fs.space, host.fs.agent, what)
         return what
+
+    async def _on_flow_config(self, frame: Dict[str, Any]) -> None:
+        """The space's flow config from the hub's editor: loaded by the host of that space (its agent), answered with
+        `flow.config.status`. A space this machine runs no flow for is ignored: the editor then shows no answer."""
+        host = self._flow.get(str(frame.get("space") or ""))
+        version, sha = frame.get("version"), frame.get("sha")
+        if host is None or not isinstance(version, int) or isinstance(version, bool) or not isinstance(sha, str):
+            return
+        async with self._flow_config_lock:
+            try:
+                ok, error = await asyncio.to_thread(host.apply_config, version, sha, frame.get("files"))
+            except Exception as e:  # disk full, permissions: reported, the previous bundle stays
+                ok, error = False, "%s: %s" % (type(e).__name__, str(e)[:200])
+        logger.info("[%s] flow config %s v%s for %s: %s", self.name, host.fs.space, version, host.fs.agent, "ok" if ok else error)
+        status = {"type": "flow.config.status", "space": host.fs.space, "agent": host.fs.agent, "version": version, "sha": sha, "ok": ok}
+        if not ok:
+            status["error"] = error or "error"
+        commit = frame.get("commit")
+        if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):   # git source: the head it came from
+            status["commit"] = commit
+        await self._send_frame(status)
 
     async def _flow_request(self, frame: Dict[str, Any]) -> Dict[str, Any]:
         try:
