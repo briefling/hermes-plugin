@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.13"
+VERSION = "0.2.14"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -103,6 +103,7 @@ TOKEN_MARGIN_S = 120
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 FLOW_TIMER_S = 30            # flow: how often the timer checks whether a host is due (poll_min)
 FLOW_MSG_PREFIX = "flow-"    # message id of a task turn's internal event
+FLOW_WAKE_MIN_S = 60         # flow.wake: ignored less than this after the host's last tick (docs/design-flow.md § 4.4)
 FLOW_USER = "briefling-flow"
 FLOW_PREAMBLE = (
     "[briefling] Board task, started by the flow (not by a human request). Work it with the board_* tools. In this "
@@ -767,9 +768,15 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._on_stop(frame)
         elif kind == "flow.config":
             await self._on_flow_config(frame)
+        elif kind == "flow.pause":
+            await self._on_flow_pause(frame)
+        elif kind == "flow.wake":
+            self._on_flow_wake(frame)
         elif kind == "subscribed":
             if frame.get("denied"):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
+            for host in list(self._flow.values()):   # the hub may hold an old state: report it again
+                await self._flow_report(host, force=True)
         elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "memory.proposed", "memory.reviewed", "flow.result"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1220,7 +1227,46 @@ class BrieflingAdapter(BasePlatformAdapter):
             logger.warning("[%s] flow tick %s failed", self.name, host.fs.space, exc_info=True)
             return "error"
         logger.info("[%s] flow tick %s/%s: %s", self.name, host.fs.space, host.fs.agent, what)
+        await self._flow_report(host)
         return what
+
+    async def _flow_report(self, host: "FlowHost", force: bool = False) -> None:
+        """`flow.state` to the hub when what it shows changed (pause, task, spend, caps, alerts), or `force`."""
+        snap = getattr(host, "snapshot", None)
+        if snap is None:
+            return
+        thread = host.thread
+        running = bool(thread and (getattr(host, "task_turn", False) or thread in self._turns))
+        alive = self._turn_since.get(thread, 0) // 1000 if running and thread in self._turns else self._flow_ended.get(thread or "")
+        state = snap(running=running, alive=alive or None)
+        if not force and state == host.reported:
+            return
+        if await self._send_frame({"type": "flow.state", "space": host.fs.space, "agent": host.fs.agent, "state": state}):
+            host.reported = state
+
+    async def _on_flow_pause(self, frame: Dict[str, Any]) -> None:
+        """Pause / Resume of this machine's agent from briefling (a trusted human; the hub checked it)."""
+        host = self._flow.get(str(frame.get("space") or ""))
+        paused = frame.get("paused")
+        if host is None or frame.get("agent") != host.fs.agent or not isinstance(paused, bool):
+            return
+        by = re.sub(r"[\x00-\x1f\x7f]+", " ", str(frame.get("by") or "a human"))[:80]
+        changed = await host.set_paused(paused, by)
+        logger.info("[%s] flow %s/%s %s by %s%s", self.name, host.fs.space, host.fs.agent, "paused" if paused else "resumed",
+                    by, "" if changed else " (no change)")
+        await self._flow_report(host, force=True)
+        if changed and not paused:
+            self._on_flow_wake({"space": host.fs.space})
+
+    def _on_flow_wake(self, frame: Dict[str, Any]) -> None:
+        """« Read the board now »: a normal tick, unless the host ticked less than FLOW_WAKE_MIN_S ago."""
+        host = self._flow.get(str(frame.get("space") or ""))
+        if host is None:
+            return
+        if time.time() - host.last_tick < FLOW_WAKE_MIN_S:
+            logger.debug("[%s] flow wake %s skipped: ticked %.0f s ago", self.name, host.fs.space, time.time() - host.last_tick)
+            return
+        asyncio.ensure_future(self._flow_tick(host))
 
     async def _on_flow_config(self, frame: Dict[str, Any]) -> None:
         """The space's flow config from the hub's editor: loaded by the host of that space (its agent), answered with
@@ -1278,6 +1324,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         host = self._flow.get(self._thread_space.get(thread, ""))
         if host is not None:
             host.add_usage("discussion", usage)
+            asyncio.ensure_future(self._flow_report(host))
 
     def flow_host(self, thread: str) -> Optional["FlowHost"]:
         return self._flow.get(self._thread_space.get(thread, ""))

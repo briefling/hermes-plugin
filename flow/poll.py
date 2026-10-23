@@ -145,7 +145,7 @@ def poll(agent: str, co: Company, boards: dict[str, Board], state: dict, now: in
     if usage is not None:
         usage = _once(usage)                                            # one database read per poll
     reason = check_quota(work, limits, usage, now)
-    if reason:
+    if reason and work.get("quota_waived") != today:   # briefling: a human resumed a quota pause, for the rest of the day
         work["paused"] = {"ts": now, "reason": reason, "by": "quota"}
         _alert(work, now, "-", "%s paused: %s. Resume from briefling to restart." % (agent, reason))
         return _finish(state, work, seen, "", dry_run)

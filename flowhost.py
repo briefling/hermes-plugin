@@ -30,7 +30,7 @@ from .flowconfig import ConfigStore
 from .flow.backends.github import GitHubBoard
 from .flow.identity import make_token
 from .flow.model import AGENT_MARK
-from .flow.poll import poll
+from .flow.poll import MONTH_S, poll
 from .flow.usage import USAGE_KEYS, usage_delta
 from .flow.status import parse_status, status_body
 
@@ -40,6 +40,14 @@ DEFAULT_POLL_MIN = 5.0
 MIN_POLL_MIN = 1.0
 NOTHING_LEARNED = {"none", "nothing", "-"}
 ZERO = {k: 0 for k in USAGE_KEYS}
+ALERTS_SHOWN = 5                 # flow.state: the latest engine alerts of the last week (lost task, quota pause)
+ALERTS_AGE_S = 7 * 86400
+TAGS = ("task", "discussion")
+
+
+def local_day(ts: float) -> str:
+    """Calendar day in local time, as the engine's daily quota counts it."""
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
 class HubAnswer(Exception):
@@ -122,6 +130,8 @@ class FlowHost:
         self.task_turn = False            # a task turn of this host is running (no tick meanwhile)
         self.last_tick = 0.0
         self.poll_min: Optional[float] = None  # the agent's `limits.poll_min` in the config, read at each tick
+        self.caps: Dict[str, Optional[float]] = {"day": None, "month": None}  # cost caps of the config, read at each tick
+        self.reported: Optional[Dict[str, Any]] = None  # last `flow.state` the hub accepted (sent again only on change)
 
     # -- state -----------------------------------------------------------------
     def _load(self) -> Dict[str, Any]:
@@ -152,11 +162,55 @@ class FlowHost:
         return add_counters(c.get("task") or ZERO, c.get("discussion") or ZERO)
 
     def add_usage(self, tag: str, turn_usage: Optional[Dict[str, Any]]) -> None:
+        """One turn's spend, tagged. The ledger (30 days) feeds the display; a discussion turn while no task runs also
+        goes into the engine's spend, so the quotas count everything (during a task, the engine's running delta
+        already includes it)."""
         if not turn_usage:
             return
         c = self.state.setdefault("counters", {})
         c[tag] = add_counters(c.get(tag) or ZERO, to_counters(turn_usage))
+        now, cost = int(self._clock()), float(turn_usage.get("usd", 0) or 0)
+        self.state["ledger"] = [e for e in self.state.get("ledger") or [] if e[0] >= now - MONTH_S] + [[now, tag, round(cost, 6)]]
+        if tag == "discussion" and cost and not self.engine.get("current"):
+            self.engine["spend"] = (self.engine.get("spend") or []) + [[now, cost]]
         self.save()
+
+    # -- display and pause (docs/design-flow.md § 4.6) ------------------------------
+    def snapshot(self, running: bool = False, alive: Optional[int] = None) -> Dict[str, Any]:
+        """What `flow.state` reports: pause, current task, spend today / 30 days per tag against the caps, alerts."""
+        now = int(self._clock())
+        today = local_day(now)
+        led = [e for e in self.state.get("ledger") or [] if e[0] >= now - MONTH_S]
+        usage = {tag: {"day": round(sum(c for t, g, c in led if g == tag and local_day(t) == today), 4),
+                       "month": round(sum(c for _, g, c in led if g == tag), 4)} for tag in TAGS}
+        p = self.engine.get("paused")
+        paused = {"by": "quota" if p.get("by") == "quota" else "human", "reason": str(p.get("reason") or "")[:200],
+                  "since": int(p.get("ts") or 0)} if isinstance(p, dict) else None
+        cur = self.engine.get("current")
+        current = {"ref": str(cur.get("ref")), "trigger": str(cur.get("trigger")), "thread": self.thread,
+                   "since": int(cur.get("delivered0") or 0), "running": bool(running and self.thread),
+                   "alive": int(alive) if alive else None} if isinstance(cur, dict) and cur.get("ref") else None
+        alerts = [{"at": int(a.get("ts") or 0), "ref": str(a.get("ref") or "-"), "text": str(a.get("msg") or "")[:300]}
+                  for a in (self.engine.get("alerts") or []) if int(a.get("ts") or 0) >= now - ALERTS_AGE_S][-ALERTS_SHOWN:]
+        return {"paused": paused, "current": current, "usage": usage, "caps": dict(self.caps), "alerts": alerts}
+
+    async def set_paused(self, paused: bool, by: str) -> bool:
+        """Pause / Resume from briefling. A running turn is not cut; a paused agent takes no new task. Resume also
+        lifts a quota pause, for the rest of the day (the cap applies again tomorrow). Returns whether it changed."""
+        async with self.lock:
+            now = int(self._clock())
+            if paused:
+                if self.engine.get("paused"):
+                    return False
+                self.engine["paused"] = {"ts": now, "reason": "paused from briefling by %s" % by, "by": "human"}
+            else:
+                p = self.engine.pop("paused", None)
+                if not p:
+                    return False
+                if isinstance(p, dict) and p.get("by") == "quota":
+                    self.engine["quota_waived"] = local_day(now)
+            self.save()
+            return True
 
     # -- config ----------------------------------------------------------------
     def config_dir(self) -> Path:
@@ -189,8 +243,11 @@ class FlowHost:
     # -- tick ------------------------------------------------------------------
     def _poll(self, alive: Optional[int]) -> str:
         co = self.company()
-        pm = co.limits_for(self.fs.agent).get("poll_min")
+        limits = co.limits_for(self.fs.agent)
+        pm = limits.get("poll_min")
         self.poll_min = float(pm) if isinstance(pm, (int, float)) and pm > 0 else None
+        self.caps = {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+                     for k, v in (("day", limits.get("max_cost_per_day")), ("month", limits.get("max_cost_per_month")))}
         return poll(self.fs.agent, co, self.boards(co), self.engine, now=int(self._clock()), usage=self.usage, alive=alive)
 
     async def tick(self, alive: Optional[int] = None) -> str:
@@ -201,6 +258,8 @@ class FlowHost:
             self.last_tick = self._clock()
             await self._flush()
             if self.state.get("pending"):
+                if self.engine.get("paused"):      # paused after the engine picked it: it waits for Resume
+                    return "paused"
                 return await self._start()
             if self._company_default and not self.has_config():
                 return "no_config"
@@ -210,7 +269,7 @@ class FlowHost:
             for rec in finished:
                 await self._done(rec)
             if not out:
-                return "idle"
+                return "paused" if self.engine.get("paused") else "idle"
             cur = self.engine.get("current") or {}
             self.state["pending"] = {"key": cur.get("key"), "ref": cur.get("ref"), "trigger": cur.get("trigger"),
                                      "title": cur.get("title") or cur.get("ref"), "text": out}
