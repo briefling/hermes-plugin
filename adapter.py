@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.11"
+VERSION = "0.2.12"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -108,6 +108,13 @@ FLOW_PREAMBLE = (
     "[briefling] Board task, started by the flow (not by a human request). Work it with the board_* tools. In this "
     "turn propose_issue, turn_outcome, acquire_resource, pushed_commits and the memory tools are refused: the board "
     "status says how the task ends. A human may answer in this thread after your turn.\n\n")
+# Returned with a successful turn_outcome 'done': a suggestion, never an obligation (no extra call, no frame).
+MEMORY_NUDGE = (
+    "Optional, before you stop: did this thread verify a durable fact about the project (a decision and its reason, "
+    "where something lives, a pitfall and its cause) that the project memory does not have yet? If so, propose it "
+    "with memory_propose (0 to 3 entries, memory_search first to avoid duplicates). Nothing worth keeping is a normal "
+    "answer: then just end your turn. Project memory = facts of the project, for every agent of the space; your "
+    "skills = your own procedures as an agent (how you deploy, test, work with a human).")
 RESOURCE_RE = re.compile(r"[a-z][a-z0-9-]{0,23}(?::[a-z0-9][a-z0-9._-]{0,47})?")  # protocol/frames.ts RESOURCE_RE (fullmatch)
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -967,7 +974,9 @@ class BrieflingAdapter(BasePlatformAdapter):
             return {"ok": False, "error": e.code, "detail": OUTCOME_ERRORS.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
-        return {"ok": True, "detail": "Shown in the thread: the human sees what you wait for." if outcome == "waiting" else "Thread marked as finished."}
+        if outcome == "waiting":
+            return {"ok": True, "detail": "Shown in the thread: the human sees what you wait for."}
+        return {"ok": True, "detail": "Thread marked as finished.", "memory": MEMORY_NUDGE}
 
     async def acquire_resource(self, thread: str, resource: str) -> Dict[str, Any]:
         """Take a shared resource of the space (answer `resource.result`: granted, or queued = thread parked)."""
@@ -1597,7 +1606,8 @@ MEMORY_PROPOSE_SCHEMA = {
         "you did not verify. kind 'rule' when it tells agents how to behave ('always/never do X'): a human must "
         "approve it. Sources are required: where it comes from (file path, issue, URL, 'this thread'). You never write "
         "the memory directly: depending on the space's settings, the entry is published at once or waits for a human "
-        "in the Memory view. Search first (memory_search) to avoid duplicates."
+        "in the Memory view. Search first (memory_search) to avoid duplicates. Split: the project memory keeps the "
+        "facts of the project, for every agent of the space; your skills keep your own procedures as an agent."
     ),
     "parameters": {
         "type": "object",
