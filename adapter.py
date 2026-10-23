@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.14"
+VERSION = "0.2.15"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -92,6 +92,12 @@ MAX_BRIEF = 1500  # protocol/frames.ts MAX_BRIEF
 MAX_STATUS = 200  # protocol/frames.ts MAX_STATUS
 MAX_ACTIVITY = 10  # protocol/frames.ts MAX_ACTIVITY (status.recent)
 MAX_ACTION = 200  # protocol/frames.ts MAX_ACTION
+# turn_outcome waiting with nothing posted yet: how long to wait for text the gateway still has queued. Text written
+# in the same model step as the tool call goes through the gateway's stream consumer (a queue drained every
+# ~50 ms on the loop), so it can reach send/edit_message just after the tool starts.
+SPOKE_GRACE_S = 2.0
+NO_TEXT = ("Nothing was posted in this thread during this turn: the human would see only the banner. Write your "
+           "answer first (findings, options, the question), then call turn_outcome again.")
 MAX_ABOUT = 4000  # protocol/frames.ts MAX_ABOUT (space description, admin-written)
 NEW_ISSUE_TITLE_MAX = 256  # protocol/frames.ts NEW_ISSUE_TITLE_MAX (GitHub's limit)
 NEW_ISSUE_BODY_MAX = 20_000  # protocol/frames.ts NEW_ISSUE_BODY_MAX
@@ -618,6 +624,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=600)
         self._opened = asyncio.Event()
         self._turns: set = set()  # threads whose turn is running here (processing hooks)
+        self._spoke: set = set()  # threads with non-empty text posted since their turn started (waiting gate)
         self._stop_asked: Dict[str, str] = {}  # thread -> who asked the hub to stop its running turn
         self._stop_ids: set = set()  # message ids of the synthetic /stop events: the gateway's reply to them is dropped
         self._stop_tasks: set = set()
@@ -892,6 +899,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         msg_id = new_id()
         ok = await self._send_frame({"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": content[:MAX_TEXT], "rev": self._next_rev()})
+        self._mark_spoke(chat_id, content, ok)
         return SendResult(success=ok, message_id=msg_id if ok else None, error=None if ok else "hub not connected")
 
     async def _upload(self, chat_id: str, path: str, file_name: Optional[str] = None) -> Optional[str]:
@@ -973,8 +981,21 @@ class BrieflingAdapter(BasePlatformAdapter):
         return {"ok": True, "card": ack.get("msg_id"),
                 "detail": "Draft shown in the topic; the admin reviews it, applies it to the space settings and saves."}
 
+    def _mark_spoke(self, thread: str, content: str, ok: bool) -> None:
+        if ok and (content or "").strip():
+            self._spoke.add(str(thread))
+
+    async def _has_spoken(self, thread: str) -> bool:
+        """True once text was posted in this turn; waits SPOKE_GRACE_S for text still queued in the gateway."""
+        deadline = time.monotonic() + SPOKE_GRACE_S
+        while thread not in self._spoke and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        return thread in self._spoke
+
     async def turn_outcome(self, thread: str, outcome: str, action: str = "") -> Dict[str, Any]:
         """Tell the hub how this turn ends (done, or waiting for a human action). The hub applies the gates."""
+        if outcome == "waiting" and not await self._has_spoken(thread):
+            return {"ok": False, "error": "no_text", "detail": NO_TEXT}
         frame: Dict[str, Any] = {"type": "thread.outcome", "thread": thread, "outcome": outcome}
         if outcome == "waiting":
             frame["action"] = " ".join(action.split())[:MAX_ACTION]
@@ -1088,6 +1109,7 @@ class BrieflingAdapter(BasePlatformAdapter):
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         ok = await self._send_frame({"type": "message.final", "thread": chat_id, "msg_id": message_id, "text": content[:MAX_TEXT], "rev": self._next_rev()})
+        self._mark_spoke(chat_id, content, ok)
         return SendResult(success=ok, message_id=message_id if ok else None, error=None if ok else "hub not connected")
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
@@ -1172,6 +1194,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         thread = getattr(event.source, "chat_id", None)
         if thread:
             self._turns.add(thread)
+            self._spoke.discard(thread)
             self._stop_asked.pop(thread, None)
             take_acted(thread)  # tools of an earlier turn don't count
             self._reset_progress(thread)
@@ -1182,6 +1205,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         thread = getattr(event.source, "chat_id", None)
         if thread:
             self._turns.discard(thread)
+            self._spoke.discard(thread)
             self._reset_progress(thread)
             usage = take_usage(thread)
             acted = take_acted(thread)
@@ -1487,6 +1511,8 @@ OUTCOME_SCHEMA = {
         "'waiting' = finished on your side, but you need the human to do something before it is really over "
         "(e.g. '/restart the gateway', 'approve PR #12', 'add secret X'); the thread stays in their 'Your turn' list, "
         "showing the action, until they reply or click 'Done'. Not for a question (use clarify). "
+        "Before 'waiting', write your whole answer as message text in this thread (findings, options, the question): "
+        "the action is only a short banner label, and 'waiting' is refused if nothing was posted during this turn. "
         "If you are still working or waiting on a third party, don't call it. "
         "In a space you may hold a limited number of threads at once (one in strict mode): 'done' frees your place "
         "for the next waiting thread; 'waiting' (or a pending question) keeps it, so say 'done' as soon as the task is "
@@ -1498,7 +1524,7 @@ OUTCOME_SCHEMA = {
             "outcome": {"type": "string", "enum": ["done", "waiting"]},
             "action": {"type": "string", "description": (
                 "Required for 'waiting': the action expected from the human, one short imperative line (max 200 chars), "
-                "in the team's language.")},
+                "in the team's language. A label for the banner, never the answer itself.")},
         },
         "required": ["outcome"],
     },
