@@ -45,7 +45,14 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
 
 Config (env, or ``platforms.briefling.extra``): BRIEFLING_WS_URL, BRIEFLING_TOKEN_URL,
 BRIEFLING_CLIENT_ID, BRIEFLING_CLIENT_SECRET, BRIEFLING_SPACES (comma-separated, or ``*`` = every space
-the hub opened to this instance), BRIEFLING_ALLOWED_USERS.
+the hub opened to this instance), BRIEFLING_ALLOWED_USERS, BRIEFLING_ALLOWED_FROM.
+
+Allowlist: by default the humans in BRIEFLING_ALLOWED_USERS, written on the agent host (a second gate, independent
+from the hub). ``BRIEFLING_ALLOWED_FROM=hub`` makes the host follow the hub instead: each space's leads and
+contributors (``subscribed.allowed``, then ``allowed`` on every settings save), checked per space at intake and by
+the gateway through ``enforces_own_access_policy`` + ``_is_dm_allowed`` (live, no restart). Leave
+BRIEFLING_ALLOWED_USERS and GATEWAY_ALLOWED_USERS empty then: the gateway gives an env allowlist priority.
+Before the first list arrives, nobody is allowed (fail closed).
 """
 
 import asyncio
@@ -87,7 +94,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.17"
+VERSION = "0.2.18"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -618,6 +625,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._approvals: Dict[str, Tuple[str, str, Dict[str, str]]] = {}
         # An approval press bypasses the gateway's own allowlist check: re-check it here (deny if empty).
         self._allowed_users = {u.strip() for u in _setting(extra, "allowed_users", "BRIEFLING_ALLOWED_USERS").split(",") if u.strip()}
+        # BRIEFLING_ALLOWED_FROM=hub: the allowlist is the hub's, per space (space -> Cognito subs), empty until received.
+        self._from_hub = _setting(extra, "allowed_from", "BRIEFLING_ALLOWED_FROM").lower() == "hub"
+        self._hub_allowed: Dict[str, frozenset] = {}
+        if self._from_hub:
+            # Hermes then asks this adapter (``_is_dm_allowed``) instead of an env list, as long as none is set.
+            self._dm_policy = "allowlist"
+            for env in ("BRIEFLING_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
+                if _get_scoped_secret(env, "").strip():
+                    logger.warning("[briefling] BRIEFLING_ALLOWED_FROM=hub but %s is set: the gateway checks that list "
+                                   "first, remove it to follow the hub", env)
         self._thread_space: Dict[str, str] = {}  # thread -> space (needed to upload a file into it)
         self._waiting: Dict[str, asyncio.Future] = {}  # client_id -> future(upload.ready / ack frame)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -771,6 +788,29 @@ class BrieflingAdapter(BasePlatformAdapter):
 
     # -- inbound -------------------------------------------------------------
 
+    def allows(self, user: str, space: Optional[str] = None) -> bool:
+        """May this human's message or click make the agent act? Host list, or the hub's for that space (any space
+        when unknown: the gateway's check has no conversation; the hub already gated it per space and per role)."""
+        if not self._from_hub:
+            return user in self._allowed_users
+        if space is None:
+            return any(user in s for s in self._hub_allowed.values())
+        return user in self._hub_allowed.get(space, frozenset())
+
+    @property
+    def enforces_own_access_policy(self) -> bool:  # type: ignore[override]
+        """Hub mode: Hermes asks ``_is_dm_allowed`` when no env allowlist is set (a property on the base adapter)."""
+        return getattr(self, "_from_hub", False)
+
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """Hermes' live check of an own-policy adapter (hub mode only: otherwise the env allowlist decides)."""
+        return self._from_hub and self.allows(str(sender_id or ""))
+
+    def _on_allowed(self, space: Any, users: Any) -> None:
+        if not (isinstance(space, str) and ID_RE.match(space) and isinstance(users, list)):
+            return
+        self._hub_allowed[space] = frozenset(u for u in users[:200] if isinstance(u, str) and 0 < len(u) <= 128)
+
     async def _on_frame(self, frame: Dict[str, Any]) -> None:
         kind = frame.get("type")
         logger.debug("[%s] frame %s %s", self.name, kind, (frame.get("message") or {}).get("type", ""))
@@ -786,7 +826,13 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._on_flow_wake(frame)
         elif kind == "flow.pilot":
             await self._on_flow_pilot(frame)
+        elif kind == "allowed":
+            self._on_allowed(frame.get("space"), frame.get("users"))
         elif kind == "subscribed":
+            if isinstance(frame.get("allowed"), dict):  # a new connection: the hub's lists replace the old ones
+                self._hub_allowed = {}
+                for space, users in frame["allowed"].items():
+                    self._on_allowed(space, users)
             for host in list(self._flow.values()):   # a new connection: nobody pilots until the hub's flow.pilot says so
                 host.piloted = False
             if frame.get("denied"):
@@ -814,6 +860,10 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._titles[thread] = str((frame.get("context") or {}).get("title") or thread)
         if isinstance(frame.get("space"), str):
             self._thread_space[thread] = frame["space"]
+        author_id = str((msg.get("author") or {}).get("id") or "")
+        if self._from_hub and not self.allows(author_id, frame.get("space") if isinstance(frame.get("space"), str) else ""):
+            logger.warning("[%s] message dropped: author not allowed by the hub in this space", self.name)
+            return
         if msg.get("type") == "answer" and ((msg.get("ask") or {}).get("id") or "") in self._approvals:
             await self._on_approval_answer(thread, msg["ask"]["id"], str((msg.get("author") or {}).get("id") or ""), text)
             return
@@ -851,8 +901,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         thread, by = frame.get("thread"), str(frame.get("by") or "")
         if not (isinstance(thread, str) and ID_RE.match(thread)):
             return
-        if by not in self._allowed_users:  # same second gate as approvals (deny if the allowlist is empty)
-            logger.warning("[%s] stop ignored: author not in BRIEFLING_ALLOWED_USERS", self.name)
+        if not self.allows(by, self._thread_space.get(thread, "")):  # same second gate as approvals (deny if empty)
+            logger.warning("[%s] stop ignored: author not allowed", self.name)
             return
         if thread not in self._turns:
             return  # the turn already ended: its turn.ended is on its way and clears the request
@@ -1168,9 +1218,10 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def _on_approval_answer(self, thread: str, ask_id: str, author: str, text: str) -> None:
         card_thread, session_key, labels = self._approvals[ask_id]
         choice = labels.get(text.strip())
-        if thread != card_thread or author not in self._allowed_users or not choice:
+        allowed = self.allows(author, self._thread_space.get(thread, ""))
+        if thread != card_thread or not allowed or not choice:
             logger.warning("[%s] approval answer ignored (thread match %s, author allowed %s, known label %s)",
-                           self.name, thread == card_thread, author in self._allowed_users, bool(choice))
+                           self.name, thread == card_thread, allowed, bool(choice))
             return  # the card stays answerable by the right person
         self._approvals[ask_id] = (card_thread, session_key, {})  # answered: a second press is dropped, never relayed
         from tools.approval import resolve_gateway_approval

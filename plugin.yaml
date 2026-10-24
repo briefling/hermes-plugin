@@ -1,7 +1,7 @@
 name: briefling
 label: briefling
 kind: platform
-version: 0.2.17
+version: 0.2.18
 author: opcode
 description: >
   briefling gateway adapter: one outbound WebSocket to the briefling hub (AWS).
@@ -32,4 +32,8 @@ optional_env:
   - name: BRIEFLING_ALLOWED_USERS
     description: "Comma-separated Cognito sub of humans allowed to drive the agent"
     prompt: "briefling allowed users"
+    password: false
+  - name: BRIEFLING_ALLOWED_FROM
+    description: "hub = follow the hub's leads and contributors of each space instead of BRIEFLING_ALLOWED_USERS (leave that one empty)"
+    prompt: "briefling allowlist source (hub, or empty)"
     password: false
