@@ -20,7 +20,10 @@ from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
-from .adapter import PROTOCOL, PROTOCOL_VERSION
+# Same values as adapter.PROTOCOL / adapter.PROTOCOL_VERSION (pinned by tests/test_join.py). Kept here so this module
+# imports without Hermes: the ACP bridge (acp-bridge/, outside Hermes) reuses it as is.
+PROTOCOL = "briefling.v2"
+PROTOCOL_VERSION = 2
 
 CODE_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")  # AGENT_CODE_RE in protocol/frames.ts
 TIMEOUT_S = 20

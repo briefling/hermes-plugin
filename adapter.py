@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.18"
+VERSION = "0.2.19"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -426,6 +426,8 @@ CI_ERRORS = {
 }
 CI_MAX_COMMITS = 5  # protocol/frames.ts CI_MAX_COMMITS
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+# protocol/frames.ts BRANCH_RE: no "..", no leading "-" or "/", no space nor control character.
+BRANCH_RE = re.compile(r"(?![-/])(?!.*\.\.)[A-Za-z0-9._/-]{1,200}")
 HUB_UNREACHABLE = {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
 # Project memory: protocol/memory.ts limits.
 MEMORY_TEXT_MAX = 1000
@@ -521,8 +523,12 @@ def with_context(context: Dict[str, Any], text: str) -> str:
                  f"a human creates it): {', '.join(repos)}.]\n")
     ci = [x for x in (context.get("ci") or []) if isinstance(x, str) and REPO_RE.fullmatch(x)]
     if ci:
-        head += (f"[CI follow-up is on: after you push to {', '.join(ci)}, call pushed_commits with the repo and full sha "
-                 f"of each pushed head; briefling shows their CI result in this thread.]\n")
+        head += (f"[CI follow-up is on: after you push to {', '.join(ci)}, call pushed_commits with the repo, full sha "
+                 f"and branch of each pushed head; briefling shows their CI result in this thread.]\n")
+    pushed = [x for x in (context.get("pushed") or []) if isinstance(x, str) and REPO_RE.fullmatch(x)]
+    if pushed and not ci:
+        head += (f"[After you push to {', '.join(pushed)}, call pushed_commits with the repo, full sha and branch of each "
+                 f"pushed head; briefling lists them in the thread info with their pull request.]\n")
     if context.get("parallel") is True:
         head += ("[You may be working on other threads of this space at the same time: work in a git worktree "
                  "dedicated to this thread, never in a copy another thread uses.]\n")
@@ -1162,7 +1168,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             return {"ok": False, "error": e.code, "detail": CI_ERRORS.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
-        return {"ok": True, "detail": "CI followed: its result shows in this thread (up to one hour). Nothing else to do."}
+        return {"ok": True, "detail": "Recorded: listed in the thread info (CI result shown in this thread when the space follows it). Nothing else to do."}
 
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], file_name: Optional[str] = None) -> SendResult:
         fid = await self._upload(chat_id, path, file_name)
@@ -1734,11 +1740,12 @@ def release_resource_tool(args: Dict[str, Any], **_: Any) -> str:
 PUSHED_SCHEMA = {
     "name": "pushed_commits",
     "description": (
-        "briefling only, in a thread of a space with CI follow-up on (the message context then lists the followed "
-        "repos): right after your last git push of the turn to one of those repos, declare the commit(s) you pushed "
-        "(the new head of each pushed branch). briefling reads their CI on GitHub (checks and commit statuses) and "
-        "shows the result in the thread for the humans. Declare only commits you pushed yourself in this thread; a new "
-        "commit for the same repo replaces the previous one. Do not wait for the CI result: end your turn as usual."
+        "briefling only, in a thread of a space with attached repos (the message context then lists them): right "
+        "after your last git push of the turn to one of those repos, declare the commit(s) you pushed (the new head of "
+        "each pushed branch, with that branch). briefling lists them in the thread info with their pull request and, "
+        "when the space has CI follow-up on, reads their CI on GitHub and shows the result in the thread. Declare only "
+        "commits you pushed yourself in this thread; a new commit for the same repo replaces the previous one. Do not "
+        "wait for any result: end your turn as usual."
     ),
     "parameters": {
         "type": "object",
@@ -1750,6 +1757,7 @@ PUSHED_SCHEMA = {
                     "properties": {
                         "repo": {"type": "string", "description": "owner/name, one of the followed repos listed in the message context."},
                         "sha": {"type": "string", "description": "Full 40-character sha of the pushed commit (git rev-parse HEAD)."},
+                        "branch": {"type": "string", "description": "Branch you pushed it to (git branch --show-current), e.g. main or feat/x."},
                     },
                     "required": ["repo", "sha"],
                 },
@@ -1775,7 +1783,10 @@ def pushed_commits_tool(args: Dict[str, Any], **_: Any) -> str:
         sha = str((c or {}).get("sha") or "").strip().lower() if isinstance(c, dict) else ""
         if not REPO_RE.fullmatch(repo) or not SHA_RE.fullmatch(sha):
             return tool_error("each commit needs repo (owner/name) and the full 40-character sha (git rev-parse HEAD).")
-        commits.append({"repo": repo, "sha": sha})
+        branch = str(c.get("branch") or "").strip()
+        if branch and not BRANCH_RE.fullmatch(branch):
+            return tool_error("branch must be a plain git branch name (letters, digits, . _ / -), as git branch --show-current prints it.")
+        commits.append({"repo": repo, "sha": sha, **({"branch": branch} if branch else {})})
     return _on_adapter("pushed_commits", thread, lambda a: a.pushed_commits(thread, commits))
 
 
