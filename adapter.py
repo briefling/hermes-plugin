@@ -130,6 +130,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     ISSUE_SCHEMA,
     ABOUT_SCHEMA,
     OUTCOME_SCHEMA,
+    clean_summary,
     RESOURCE_PARAMS,
     ACQUIRE_SCHEMA,
     RELEASE_SCHEMA,
@@ -146,7 +147,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.20"
+VERSION = "0.2.21"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -907,13 +908,17 @@ class BrieflingAdapter(BasePlatformAdapter):
             await asyncio.sleep(0.05)
         return thread in self._spoke
 
-    async def turn_outcome(self, thread: str, outcome: str, action: str = "") -> Dict[str, Any]:
-        """Tell the hub how this turn ends (done, or waiting for a human action). The hub applies the gates."""
+    async def turn_outcome(self, thread: str, outcome: str, action: str = "",
+                           summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Tell the hub how this turn ends (done, or waiting for a human action), with the thread's summary if given.
+        The hub applies the gates."""
         if outcome == "waiting" and not await self._has_spoken(thread):
             return {"ok": False, "error": "no_text", "detail": NO_TEXT}
         frame: Dict[str, Any] = {"type": "thread.outcome", "thread": thread, "outcome": outcome}
         if outcome == "waiting":
             frame["action"] = " ".join(action.split())[:MAX_ACTION]
+        if summary:
+            frame["summary"] = summary
         try:
             await self._request(frame)
         except HubRefused as e:
@@ -1415,7 +1420,10 @@ def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error("action is required for 'waiting': what must the human do?")
     if len(action) > MAX_ACTION:
         return tool_error(f"action too long ({len(action)} chars, max {MAX_ACTION}): one short line.")
-    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action))
+    summary, err = clean_summary(args.get("summary"))
+    if err:
+        return tool_error(err)
+    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary))
 
 
 def _resource_args(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
