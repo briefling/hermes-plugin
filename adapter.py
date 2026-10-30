@@ -101,6 +101,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     REPO_RE,
     ID_RE,
     MEMORY_NUDGE,
+    CARD_SHOWN,
     RESOURCE_RE,
     CONTEXT_ITEM_MAX,
     CONTEXT_TOTAL_MAX,
@@ -154,7 +155,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -922,7 +923,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             return {"ok": False, "error": e.code, "detail": PROPOSE_ERRORS.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
             return {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
-        return {"ok": True, "card": ack.get("msg_id"), "detail": "Card shown in this conversation; a human decides whether to open the thread."}
+        return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["propose_thread"]}
 
     async def propose_issue(self, thread: str, repo: str, title: str, body: str) -> Dict[str, Any]:
         """Show a "Create this issue?" card in this conversation. Nothing on GitHub until a trusted human clicks."""
@@ -934,7 +935,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
         return {"ok": True, "card": ack.get("msg_id"),
-                "detail": "Card shown in this conversation; nothing is on GitHub until a trusted human clicks Create the issue."}
+                "detail": CARD_SHOWN["propose_issue"]}
 
     async def propose_space_about(self, thread: str, text: str, why: str = "") -> Dict[str, Any]:
         """Show a space description draft card in the topic. Never written to the space: the admin applies and saves."""
@@ -948,7 +949,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "card": ack.get("msg_id"),
-                "detail": "Draft shown in the topic; the admin reviews it, applies it to the space settings and saves."}
+                "detail": CARD_SHOWN["propose_space_about"]}
 
     async def topic_title(self, thread: str, title: str) -> Dict[str, Any]:
         """Title a new Lounge topic (``thread`` = the topic, or the hidden conversation briefling opened for it)."""
