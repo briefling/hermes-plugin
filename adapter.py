@@ -42,6 +42,9 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   published memory, proposes a synthesis replacing several entries; a human approves it before anything is replaced.
 - tool ``pushed_commits`` -> ``ci.watch`` (``ack``): in a thread of a space with CI follow-up on, the agent declares the
   commits it just pushed; the hub follows their CI on GitHub and shows the result in the thread.
+- hub ``secret.deliver`` -> ``secret.received``: a secret a trusted human handed to the agent, end-to-end encrypted
+  for the in-memory key reported at subscribe (``plugin.secret_key``); stored outside the conversation (vault.py),
+  tool ``secret_totp`` for MFA codes.
 
 Config (env, or ``platforms.briefling.extra``): BRIEFLING_WS_URL, BRIEFLING_TOKEN_URL,
 BRIEFLING_CLIENT_ID, BRIEFLING_CLIENT_SECRET, BRIEFLING_SPACES (comma-separated, or ``*`` = every space
@@ -87,6 +90,7 @@ from gateway.platforms.helpers import MessageDeduplicator
 
 from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
 from .flowswitch import SwitchError, parse_link
+from . import vault
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     MAX_BRIEF,
     MAX_ACTION,
@@ -150,7 +154,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.23"
+VERSION = "0.3.0"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -516,6 +520,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._flow_ended: Dict[str, int] = {}         # thread -> end (s) of its last turn: the task's sign of life
         self._flow_loop_task: Optional[asyncio.Task] = None
         self._flow_config_lock = asyncio.Lock()       # one bundle written at a time
+        # Secrets (briefling/vault.py): key pair in memory only, new at every gateway start; None = feature off.
+        self._secret_key = vault.new_key()
 
     # -- connection ----------------------------------------------------------
 
@@ -523,6 +529,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         # "*": every space the hub opened to this instance (spaces created in the app by the admin),
         # picked up at each (re)connection. Otherwise the explicit list, as before.
         frame: Dict[str, Any] = {"type": "subscribe", "plugin": {"version": VERSION}}
+        if self._secret_key is not None:
+            frame["plugin"]["secret_key"] = vault.public_key(self._secret_key)
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
@@ -539,6 +547,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._running = True
         self._loop = asyncio.get_running_loop()
         _ADAPTERS.add(self)
+        vault.purge_all()  # leftovers of a crash: their key died with that process
         self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._run())
         if self._flow_spaces:
@@ -566,6 +575,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         if self._session:
             await self._session.close()
             self._session = None
+        vault.purge_all()
 
     async def _access_token(self) -> str:
         if self._token and time.time() < self._token_exp - TOKEN_MARGIN_S:
@@ -637,6 +647,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         ws = self._ws
         if ws is None or ws.closed:
             return False
+        if vault.has_any() and frame.get("type") != "secret.received":
+            frame = vault.redact_obj(frame)  # safety net: a value the agent echoed never reaches the hub
         async with self._send_lock:
             try:
                 await ws.send_str(json.dumps({"v": PROTOCOL_VERSION, **frame}))
@@ -675,6 +687,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         logger.debug("[%s] frame %s %s", self.name, kind, (frame.get("message") or {}).get("type", ""))
         if kind == "deliver":
             await self._on_deliver(frame)
+        elif kind == "secret.deliver":
+            await self._on_secret(frame)
         elif kind == "turn.stop":
             self._on_stop(frame)
         elif kind == "flow.config":
@@ -737,7 +751,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         # A gateway command (/approve, /stop...) must stay verbatim: prefixed with context it is no
         # longer a command and, during a turn, the gateway takes it as a redirect of the running run.
         if not MessageEvent(text=text).get_command():
-            text = with_context(frame.get("context") or {}, edit_hint(msg) + voice_hint(msg.get("files")) + text)
+            text = with_context(frame.get("context") or {},
+                                vault.hint(thread) + edit_hint(msg) + voice_hint(msg.get("files")) + text)
         source = self.build_source(
             chat_id=thread, chat_name=self._titles[thread], chat_type="dm",
             user_id=str(author.get("id") or ""), user_name=str(frame.get("author_name") or author.get("id") or ""), message_id=msg_id)
@@ -752,6 +767,41 @@ class BrieflingAdapter(BasePlatformAdapter):
         await self.handle_message(MessageEvent(
             text=text.strip(), message_type=msg_type, source=source, message_id=msg_id, raw_message=frame, timestamp=ts,
             media_urls=media_urls, media_types=media_types))
+
+    async def _on_secret(self, frame: Dict[str, Any]) -> None:
+        """Hub ``secret.deliver``: decrypt, store outside the conversation, answer ``secret.received``. Only reason
+        codes are logged, never the value or the ciphertext."""
+        thread, sid = frame.get("thread"), frame.get("id")
+        if not (isinstance(thread, str) and ID_RE.match(thread) and isinstance(sid, str) and 0 < len(sid) <= vault.ID_MAX):
+            return
+        if vault.seen(sid):  # also sent to our other live connection: handled once
+            return
+        vault.expire()
+        f = {k: frame.get(k) for k in ("space", "agent", "from", "name", "kind", "epk", "iv", "ct")}
+        try:
+            if self._secret_key is None:
+                raise vault.SecretError("off")
+            if not (isinstance(f["space"], str) and ID_RE.match(f["space"]) and isinstance(f["agent"], str)
+                    and isinstance(f["from"], str) and isinstance(f["name"], str) and vault.NAME_RE.match(f["name"])
+                    and f["kind"] in vault.KINDS and isinstance(f["epk"], str) and vault.EPK_RE.match(f["epk"])
+                    and isinstance(f["iv"], str) and vault.IV_RE.match(f["iv"]) and isinstance(f["ct"], str)
+                    and len(f["ct"]) <= vault.CT_MAX and vault.CT_RE.match(f["ct"])):
+                raise vault.SecretError("shape")
+            if not self.allows(f["from"], f["space"]):  # second gate, independent from the hub's trusted check
+                raise vault.SecretError("not_allowed")
+            value = vault.decrypt(self._secret_key, f["space"], thread, f["agent"], f["name"], f["kind"],
+                                  f["epk"], f["iv"], f["ct"])
+            vault.store(thread, f["name"], f["kind"], value)
+            self._thread_space.setdefault(thread, f["space"])
+            ok = True
+            logger.info("[%s] secret %s (%s) stored for thread %s", self.name, f["name"], f["kind"], thread)
+        except vault.SecretError as e:
+            ok = False
+            logger.warning("[%s] secret %s refused: %s", self.name, sid, e.code)
+        except Exception as e:  # never let the value reach a traceback
+            ok = False
+            logger.warning("[%s] secret %s refused: %s", self.name, sid, type(e).__name__)
+        await self._send_frame({"type": "secret.received", "thread": thread, "id": sid, "ok": ok})
 
     def _on_stop(self, frame: Dict[str, Any]) -> None:
         """Stop button (hub ``turn.stop``, trusted human already checked there): the gateway's own ``/stop``, which
@@ -1860,6 +1910,8 @@ def register(ctx) -> None:
                               description=schema["description"], emoji="📋")
         ctx.register_tool(name="flow_switch", toolset="briefling", schema=FLOW_SWITCH_SCHEMA, handler=flow_switch_tool,
                           description=FLOW_SWITCH_SCHEMA["description"], emoji="🔀")
+        ctx.register_tool(name="secret_totp", toolset="briefling", schema=vault.SECRET_TOTP_SCHEMA,
+                          handler=vault.secret_totp_tool, description=vault.SECRET_TOTP_SCHEMA["description"], emoji="🔑")
     if hasattr(ctx, "register_cli_command"):  # `hermes briefling join <code-or-link>`
         from . import join
         ctx.register_cli_command(name="briefling", help="briefling hub: join with an agent invitation",
@@ -1869,3 +1921,8 @@ def register(ctx) -> None:
         ctx.register_hook("post_api_request", on_post_api_request)
         ctx.register_hook("post_auxiliary_call", on_post_auxiliary_call)
         ctx.register_hook("pre_tool_call", on_pre_tool_call)  # turn.ended.acted after a stop
+        try:  # secrets masked in tool results before the model sees them; an older Hermes may not know the hook
+            ctx.register_hook("transform_tool_result", vault.transform_tool_result)
+        except Exception as e:
+            logger.warning("[briefling] transform_tool_result hook unavailable (%s): secrets are not masked in tool "
+                           "results", type(e).__name__)
