@@ -105,6 +105,9 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     OUTCOME_ERRORS,
     RESOURCE_ERRORS,
     ABOUT_ERRORS,
+    TITLE_ERRORS,
+    TOPIC_HEADING_MAX,
+    TOPIC_TITLE_SCHEMA,
     CI_ERRORS,
     CI_MAX_COMMITS,
     SHA_RE,
@@ -147,7 +150,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.2.21"
+VERSION = "0.2.22"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -897,6 +900,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         return {"ok": True, "card": ack.get("msg_id"),
                 "detail": "Draft shown in the topic; the admin reviews it, applies it to the space settings and saves."}
 
+    async def topic_title(self, thread: str, title: str) -> Dict[str, Any]:
+        """Title a new Lounge topic (``thread`` = the topic, or the hidden conversation briefling opened for it)."""
+        try:
+            await self._request({"type": "topic.title", "thread": thread, "title": title})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": TITLE_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "detail": "Title shown in the Lounge list. Nothing else to do for it."}
+
     def _mark_spoke(self, thread: str, content: str, ok: bool) -> None:
         if ok and (content or "").strip():
             self._spoke.add(str(thread))
@@ -1406,6 +1419,20 @@ def propose_space_about_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("propose_space_about", thread, lambda a: a.propose_space_about(thread, text, str(args.get("why") or "")))
 
 
+def topic_title_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: topic.title (the hub checks the turn, the agent in charge, a lead's topic, no title yet)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("topic_title")
+    if err:
+        return tool_error(err)
+    title = " ".join(str(args.get("title") or "").split())
+    if not title:
+        return tool_error("title is required: one short line.")
+    if len(title) > TOPIC_HEADING_MAX:
+        return tool_error(f"title too long ({len(title)} chars, max {TOPIC_HEADING_MAX}): shorten it.")
+    return _on_adapter("topic_title", thread, lambda a: a.topic_title(thread, title))
+
+
 def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: typed end-of-turn outcome (never inferred from the reply text)."""
     from tools.registry import tool_error
@@ -1806,6 +1833,8 @@ def register(ctx) -> None:
                           description=ISSUE_SCHEMA["description"], emoji="🐙")
         ctx.register_tool(name="propose_space_about", toolset="briefling", schema=ABOUT_SCHEMA, handler=propose_space_about_tool,
                           description=ABOUT_SCHEMA["description"], emoji="📝")
+        ctx.register_tool(name="topic_title", toolset="briefling", schema=TOPIC_TITLE_SCHEMA, handler=topic_title_tool,
+                          description=TOPIC_TITLE_SCHEMA["description"], emoji="🏷️")
         ctx.register_tool(name="turn_outcome", toolset="briefling", schema=OUTCOME_SCHEMA, handler=turn_outcome_tool,
                           description=OUTCOME_SCHEMA["description"], emoji="✅")
         ctx.register_tool(name="acquire_resource", toolset="briefling", schema=ACQUIRE_SCHEMA, handler=acquire_resource_tool,
