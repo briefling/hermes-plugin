@@ -40,8 +40,8 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   hidden review conversation with a batch of proposals, gives one verdict per entry (approve, reject, human).
 - tool ``memory_compact`` -> ``memory.synthesis`` (``memory.proposed``): the same memory agent, woken there to compact the
   published memory, proposes a synthesis replacing several entries; a human approves it before anything is replaced.
-- tool ``pushed_commits`` -> ``ci.watch`` (``ack``): in a thread of a space with CI follow-up on, the agent declares the
-  commits it just pushed; the hub follows their CI on GitHub and shows the result in the thread.
+- tool ``pushed_commits`` -> ``ci.watch`` (``ack``): in a work thread, the agent declares the commits it just pushed to
+  any GitHub repo (listed in Thread info); for an attached repo the hub also reads its PR and, CI follow-up on, its CI.
 - hub ``secret.deliver`` -> ``secret.received``: a secret a trusted human handed to the agent, end-to-end encrypted
   for the in-memory key reported at subscribe (``plugin.secret_key``); stored outside the conversation (vault.py),
   tool ``secret_totp`` for MFA codes.
@@ -158,7 +158,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
