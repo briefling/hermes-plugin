@@ -6,7 +6,7 @@ the hub, no inbound port.
 
 - A briefling thread is a Hermes chat (one session per thread). Turn start/end, streamed replies, clarify questions and
   exec approvals map to hub frames.
-- Tools for the agent: `turn_outcome`, `propose_thread`, `propose_space_about`, `propose_issue`, `acquire_resource`,
+- Tools for the agent: `turn_outcome`, `propose_thread`, `propose_plan`, `propose_space_about`, `propose_issue`, `acquire_resource`,
   `release_resource`. Each one sends a typed frame; the hub applies its own gates and a human confirms.
 - Only messages from humans the space trusts reach the agent (checked by the hub, then again by the plugin through
   `BRIEFLING_ALLOWED_USERS`, or the hub's list with `BRIEFLING_ALLOWED_FROM=hub`, see below).
