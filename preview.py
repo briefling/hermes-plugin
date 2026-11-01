@@ -142,6 +142,17 @@ def task_env(task_id: Optional[str]):
     raise PreviewError("peer_failed", "the agent's terminal environment is not available")
 
 
+def in_turn_context(ctx, fn):
+    """Run ``fn`` in a copy of the agent turn's context captured at ``preview_share`` (``contextvars``).
+
+    Why: an offer arrives on the adapter's own task, outside any agent turn. A multiplexed gateway reads each
+    profile's secrets only under that profile's secret scope (Hermes ``agent/secret_scope.py``, a ContextVar set
+    for the turn); without it, starting the peer (``_run_bash`` forwards the profile's env passthrough) raises
+    ``UnscopedSecretError``. Re-entering the turn's own context gives exactly that profile's scope and nothing more
+    (never a wider allowlist). A copy per call: one Context cannot be entered by two threads at once."""
+    return ctx.copy().run(fn) if ctx is not None else fn()
+
+
 def session_env(shared_env):
     """The agent's environment for a preview session, at an offer: OUTSIDE any agent turn.
 
@@ -235,6 +246,8 @@ def kill_peer(env, proc, tag: str) -> None:
 # -- shares and peers ------------------------------------------------------------------------------------------------
 
 class Peer:
+    ctx: Any = None  # the share's turn context (in_turn_context)
+
     def __init__(self, session: str, thread: str, port: int, msg: str, tag: str):
         self.session, self.thread, self.port, self.msg, self.tag = session, thread, port, msg, tag
         self.env: Any = None
@@ -266,9 +279,10 @@ class Previews:
     def share_of(self, thread: str, port: int) -> Optional[Dict[str, Any]]:
         return self.shares.get((thread, port))
 
-    def remember(self, thread: str, port: int, task_id: Optional[str], msg: str, label: str, env: Any = None) -> None:
-        # env: the agent's terminal environment, resolved in its turn (see session_env).
-        self.shares[(thread, port)] = {"task_id": task_id, "msg": msg, "label": label, "env": env}
+    def remember(self, thread: str, port: int, task_id: Optional[str], msg: str, label: str, env: Any = None, ctx: Any = None) -> None:
+        # env: the agent's terminal environment, resolved in its turn (see session_env); ctx: that turn's context
+        # (see in_turn_context), under which every later step on that environment runs.
+        self.shares[(thread, port)] = {"task_id": task_id, "msg": msg, "label": label, "env": env, "ctx": ctx}
 
     def forget(self, thread: str, port: int) -> Optional[Dict[str, Any]]:
         share = self.shares.pop((thread, port), None)
@@ -305,8 +319,9 @@ class Previews:
         stdin = json.dumps({"port": port, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)],
                             "max_s": PEER_MAX_S}) + "\n"
         try:
-            peer.env = await self.loop.run_in_executor(None, self.session_env, share.get("env"))
-            peer.proc = await self.loop.run_in_executor(None, lambda: self.spawn(peer.env, peer_command(peer.tag), stdin))
+            peer.ctx = ctx = share.get("ctx")
+            peer.env = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.session_env(share.get("env"))))
+            peer.proc = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.spawn(peer.env, peer_command(peer.tag), stdin)))
         except PreviewError as e:
             logger.warning("[briefling] preview peer not started: %s", e)
             self.peers.pop(session, None)
@@ -394,7 +409,7 @@ class Previews:
             self._kill_async(peer)
 
     def _kill_async(self, peer: Peer) -> None:
-        threading.Thread(target=self.kill, args=(peer.env, peer.proc, peer.tag), daemon=True).start()
+        threading.Thread(target=lambda: in_turn_context(peer.ctx, lambda: self.kill(peer.env, peer.proc, peer.tag)), daemon=True).start()
 
     def close_all(self, wait_s: float = 10) -> None:
         """Gateway stop: kill every peer, waiting up to ``wait_s`` for them."""
