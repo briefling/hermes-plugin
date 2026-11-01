@@ -176,7 +176,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.13"
+VERSION = "0.3.14"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1200,11 +1200,13 @@ class BrieflingAdapter(BasePlatformAdapter):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "detail": "Recorded: listed in the thread info (CI result shown in this thread when the space follows it). Nothing else to do."}
 
-    async def preview_share(self, thread: str, port: int, label: str, task_id: Optional[str]) -> Dict[str, Any]:
+    async def preview_share(self, thread: str, port: int, label: str, task_id: Optional[str], env: Any = None) -> Dict[str, Any]:
         """Post the preview line (``preview.share``, answered ``preview.shared``) and remember the share with the
-        session's ``task_id``: the offers of that line start their peer in that task's terminal environment."""
+        terminal environment resolved in the agent's turn (``env``): the offers of that line start their peer there,
+        and only while that environment is still alive (``preview.session_env``)."""
         old = self._previews.share_of(thread, port)
         if old:
+            old["env"] = env  # a share again (e.g. after its sandbox restarted) points at the live environment
             return {"ok": True, "msg": old["msg"], "detail": f"Already shared on port {port} in this thread. " + PREVIEW_SHARED}
         agent = self._thread_agent.get(thread)
         if not agent:
@@ -1216,7 +1218,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         msg = str(res.get("msg") or "")
-        self._previews.remember(thread, port, task_id, msg, label)
+        self._previews.remember(thread, port, task_id, msg, label, env)
         return {"ok": True, "msg": msg, "detail": PREVIEW_SHARED}
 
     async def preview_stop(self, thread: str, port: int) -> Dict[str, Any]:
@@ -1742,7 +1744,7 @@ def preview_share_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_:
         return tool_error(f"nothing answers on http://127.0.0.1:{port}/ in your terminal: start the server first (in the "
                           "background, listening on 127.0.0.1 or 0.0.0.0), then call preview_share again.")
     label = pv.clean_label(args.get("label"))
-    return _on_adapter("preview_share", thread, lambda a: a.preview_share(thread, port, label, task_id))
+    return _on_adapter("preview_share", thread, lambda a: a.preview_share(thread, port, label, task_id, env))
 
 
 def preview_stop_tool(args: Dict[str, Any], **_: Any) -> str:

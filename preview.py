@@ -142,6 +142,30 @@ def task_env(task_id: Optional[str]):
     raise PreviewError("peer_failed", "the agent's terminal environment is not available")
 
 
+def session_env(shared_env):
+    """The agent's environment for a preview session, at an offer: OUTSIDE any agent turn.
+
+    Gate: outside a turn Hermes has no session/profile context, so looking the environment up by
+    ``task_id`` (``get_active_env`` / ``ensure_task_env``) resolves another key (``default``) or answers « local »: a
+    sandboxed agent whose container was reaped would then get its peer started on the HOST, as the gateway user, or in
+    another profile's container. So the environment is resolved once, inside the agent's turn (``preview_share``), and
+    here it must still be that very object among Hermes' live environments (identity, no key lookup, no creation);
+    otherwise ``gone``. Only a share made on the local backend (``HostEnv``) runs on the host."""
+    if isinstance(shared_env, HostEnv):
+        return shared_env
+    if shared_env is None:
+        raise PreviewError("gone", "no terminal environment was recorded with the share")
+    try:
+        from tools.terminal_tool import _active_environments, _env_lock  # private Hermes API: fail closed when missing
+    except ImportError:
+        raise PreviewError("gone", "cannot check the agent's terminal environment (Hermes API changed)")
+    with _env_lock:
+        alive = any(e is shared_env for e in list(_active_environments.values()))
+    if not alive:
+        raise PreviewError("gone", "the agent's sandbox stopped since the share: share it again from a turn")
+    return shared_env
+
+
 def spawn_in_env(env, cmd: str, stdin_data: Optional[str] = None, timeout: int = PEER_MAX_S):
     """Run ``bash -c cmd`` in the agent's environment; returns a Popen-like handle whose ``stdout`` streams the output
     (stderr merged, text). ``stdin_data`` is written once, then stdin is closed.
@@ -234,7 +258,7 @@ class Previews:
         self.shares: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self.peers: Dict[str, Peer] = {}
         self.lock = threading.Lock()
-        self.task_env = task_env          # seams for the tests
+        self.session_env = session_env    # seams for the tests
         self.spawn = spawn_in_env
         self.kill = kill_peer
 
@@ -242,8 +266,9 @@ class Previews:
     def share_of(self, thread: str, port: int) -> Optional[Dict[str, Any]]:
         return self.shares.get((thread, port))
 
-    def remember(self, thread: str, port: int, task_id: Optional[str], msg: str, label: str) -> None:
-        self.shares[(thread, port)] = {"task_id": task_id, "msg": msg, "label": label}
+    def remember(self, thread: str, port: int, task_id: Optional[str], msg: str, label: str, env: Any = None) -> None:
+        # env: the agent's terminal environment, resolved in its turn (see session_env).
+        self.shares[(thread, port)] = {"task_id": task_id, "msg": msg, "label": label, "env": env}
 
     def forget(self, thread: str, port: int) -> Optional[Dict[str, Any]]:
         share = self.shares.pop((thread, port), None)
@@ -280,7 +305,7 @@ class Previews:
         stdin = json.dumps({"port": port, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)],
                             "max_s": PEER_MAX_S}) + "\n"
         try:
-            peer.env = await self.loop.run_in_executor(None, self.task_env, share["task_id"])
+            peer.env = await self.loop.run_in_executor(None, self.session_env, share.get("env"))
             peer.proc = await self.loop.run_in_executor(None, lambda: self.spawn(peer.env, peer_command(peer.tag), stdin))
         except PreviewError as e:
             logger.warning("[briefling] preview peer not started: %s", e)
