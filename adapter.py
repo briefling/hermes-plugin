@@ -158,6 +158,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     MEMORY_TAGS_MAX,
     MEMORY_MERGES_MAX,
     _tag_of,
+    clean_replaces,
     clean_tags,
     memory_result,
 )
@@ -168,7 +169,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.10"
+VERSION = "0.3.11"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1045,10 +1046,12 @@ class BrieflingAdapter(BasePlatformAdapter):
             return dict(HUB_UNREACHABLE)
         return memory_result(res)
 
-    async def memory_propose(self, thread: str, text: str, kind: str, sources: List[str], tags: List[str]) -> Dict[str, Any]:
+    async def memory_propose(self, thread: str, text: str, kind: str, sources: List[str], tags: List[str],
+                             replaces: Optional[List[str]] = None) -> Dict[str, Any]:
         """memory.propose: never a direct write, the space's gate decides (published, or waiting for a human)."""
         try:
-            res = await self._request({"type": "memory.propose", "thread": thread, "text": text, "kind": kind, "sources": sources, "tags": tags})
+            res = await self._request({"type": "memory.propose", "thread": thread, "text": text, "kind": kind, "sources": sources, "tags": tags,
+                                       **({"replaces": replaces} if replaces else {})})
         except HubRefused as e:
             return {"ok": False, "error": e.code, "detail": MEMORY_ERRORS.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
@@ -1873,7 +1876,10 @@ def memory_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     tags, terr = clean_tags(args.get("tags"), required=True)
     if terr:
         return tool_error(terr)
-    return _on_adapter("memory_propose", thread, lambda a: a.memory_propose(thread, text, kind, sources, tags or []))
+    replaces, rerr = clean_replaces(args.get("replaces"))
+    if rerr:
+        return tool_error(rerr)
+    return _on_adapter("memory_propose", thread, lambda a: a.memory_propose(thread, text, kind, sources, tags or [], replaces or []))
 
 
 BOARD_REF = {"type": "string", "description": "The board item, owner/repo#number (e.g. acme/app#80): one of your departments' repos."}
