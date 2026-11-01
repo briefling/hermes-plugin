@@ -169,7 +169,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.11"
+VERSION = "0.3.12"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -179,6 +179,33 @@ MAX_ACTIVITY = 10  # protocol/frames.ts MAX_ACTIVITY (status.recent)
 # in the same model step as the tool call goes through the gateway's stream consumer (a queue drained every
 # ~50 ms on the loop), so it can reach send/edit_message just after the tool starts.
 SPOKE_GRACE_S = 2.0
+# Gateway notices (lifecycle/status lines Hermes posts by itself, not the agent's words): sent with `notice: true`, the
+# client shows them as a small grey line. Hermes marks them with metadata["non_conversational"] for Discord only, so
+# the text is matched too: the Discord adapter's fallback list (plugins/platforms/discord/adapter.py
+# `_DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS`, NousResearch/hermes-agent c627ec8, MIT) plus the busy acks
+# (locales/en.yaml `busy`), the first-time tips (agent/onboarding.py) and the background-task lines. Anchored at the
+# start: an agent answer quoting one of them mid-text stays a message.
+NOTICE_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"^\s*💾\s*Self-improvement review:\s+\S",
+    r"^\s*💾\s+Skill\s+['\"].+?['\"]\s+(?:created|updated|improved|patched)\.?\s*$",
+    r"^\s*⏳\s+Working\s+—\s+\d+\s+min(?:\s|$)",
+    r"^\s*\[Background process\s+\S+\s+(?:finished with exit code|is still running~)[\s\S]*\]\s*$",
+    r"^\s*(?:✅|❌)\s+Background task (?:finished|failed)\b",
+    r"^\s*⏳\s+Background task still running\b",
+    r"^\s*(?:✅|❌)\s+Hermes update\s+(?:finished|failed|timed out)",
+    r"^\s*♻️?\s+(?:Gateway\s+(?:restarted successfully|online\b)|Restarting gateway\b|Reconnected:)",
+    r"^\s*⏳\s+(?:Draining \d+ active agent|Gateway restart already in progress)",
+    r"^\s*(?:⚡\s+Interrupting current task|↪\s+Redirected current run|⏩\s+Steered into current run"
+    r"|⏳\s+(?:Queued for the next turn|Subagent working|Compressing context))\b",
+    r"^\s*💡\s+First-time tip\b",
+))
+
+
+def is_notice(text: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
+    """A gateway notice rather than the agent's words: flagged by Hermes, or one of its known lines."""
+    if metadata and metadata.get("non_conversational"):
+        return True
+    return any(p.match(text or "") for p in NOTICE_PATTERNS)
 RECONNECT_BACKOFF = [1, 2, 5, 10, 30, 60]
 PING_EVERY_S = 300            # API Gateway closes idle connections after 10 min
 RECYCLE_AFTER_S = 110 * 60    # ... and every connection after 2 h: reconnect before
@@ -882,8 +909,13 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._stop_ids.discard(reply_to)
             return SendResult(success=True, message_id=None)
         msg_id = new_id()
-        ok = await self._send_frame({"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": content[:MAX_TEXT], "rev": self._next_rev()})
-        self._mark_spoke(chat_id, content, ok)
+        frame: Dict[str, Any] = {"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": content[:MAX_TEXT], "rev": self._next_rev()}
+        notice = is_notice(content, metadata)
+        if notice:
+            frame["notice"] = True
+        ok = await self._send_frame(frame)
+        if not notice:  # a gateway notice is not an answer: it must not unlock turn_outcome waiting
+            self._mark_spoke(chat_id, content, ok)
         return SendResult(success=ok, message_id=msg_id if ok else None, error=None if ok else "hub not connected")
 
     async def _upload(self, chat_id: str, path: str, file_name: Optional[str] = None) -> Optional[str]:
