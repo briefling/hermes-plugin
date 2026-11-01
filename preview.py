@@ -421,7 +421,7 @@ class Previews:
             if p.timer:
                 p.timer.cancel()
             if p.proc is not None:
-                th = threading.Thread(target=self.kill, args=(p.env, p.proc, p.tag), daemon=True)
+                th = threading.Thread(target=lambda p=p: in_turn_context(p.ctx, lambda: self.kill(p.env, p.proc, p.tag)), daemon=True)
                 th.start()
                 threads.append(th)
         end = time.monotonic() + wait_s
