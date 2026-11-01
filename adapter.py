@@ -46,6 +46,11 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   published entries that have none (only their tags change; a human corrects them in the Memory view).
 - tool ``pushed_commits`` -> ``ci.watch`` (``ack``): in a work thread, the agent declares the commits it just pushed to
   any GitHub repo (listed in Thread info); for an attached repo the hub also reads its PR and, CI follow-up on, its CI.
+- tools ``preview_share`` / ``preview_stop`` -> ``preview.share`` / ``preview.stop`` (``preview.shared``): the agent
+  shares 127.0.0.1:<port> of its terminal with the thread's leads (probe first, in that terminal); hub
+  ``preview.offer`` starts one peer (preview_peer.py, headless Chromium) INSIDE the agent's terminal environment,
+  whose stdout lines become ``preview.answer`` / ``preview.candidate`` / ``preview.failed``; ``preview.close`` kills it
+  (preview.py).
 - hub ``secret.deliver`` -> ``secret.received``: a secret a trusted human handed to the agent, end-to-end encrypted
   for the in-memory key reported at subscribe (``plugin.secret_key``); stored outside the conversation (vault.py),
   tool ``secret_totp`` for MFA codes.
@@ -95,7 +100,9 @@ from gateway.platforms.helpers import MessageDeduplicator
 from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
 from .flowswitch import SwitchError, parse_link
 from . import vault
+from . import preview as pv
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
+    PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
     MAX_ACTION,
     NO_TEXT,
@@ -169,7 +176,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.12"
+VERSION = "0.3.13"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -564,6 +571,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._flow_config_lock = asyncio.Lock()       # one bundle written at a time
         # Secrets (briefling/vault.py): key pair in memory only, new at every gateway start; None = feature off.
         self._secret_key = vault.new_key()
+        # Agent web preview (preview.py): shares of this gateway (memory only) and their live peers.
+        self._thread_agent: Dict[str, str] = {}  # thread -> agent the hub delivered it to (preview.share names it)
+        self._previews = pv.Previews(self._send_frame)
 
     # -- connection ----------------------------------------------------------
 
@@ -601,6 +611,8 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._running = False
         _ADAPTERS.discard(self)
+        if self._previews.peers:  # gateway stop: no preview peer outlives it
+            await asyncio.get_running_loop().run_in_executor(None, self._previews.close_all)
         self._mark_disconnected()
         if self._flow_loop_task:
             self._flow_loop_task.cancel()
@@ -741,6 +753,10 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._on_flow_wake(frame)
         elif kind == "flow.pilot":
             await self._on_flow_pilot(frame)
+        elif kind == "preview.offer":
+            await self._previews.offer(frame)
+        elif kind == "preview.close":
+            self._previews.close(frame.get("session"))
         elif kind == "allowed":
             self._on_allowed(frame.get("space"), frame.get("users"))
         elif kind == "subscribed":
@@ -755,7 +771,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
         elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result",
-                      "flow.switched"):
+                      "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
                 fut.set_result(frame)
@@ -775,6 +791,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._titles[thread] = str((frame.get("context") or {}).get("title") or thread)
         if isinstance(frame.get("space"), str):
             self._thread_space[thread] = frame["space"]
+        if isinstance(frame.get("agent"), str) and frame["agent"]:
+            self._thread_agent[thread] = frame["agent"]
         author_id = str((msg.get("author") or {}).get("id") or "")
         if self._from_hub and not self.allows(author_id, frame.get("space") if isinstance(frame.get("space"), str) else ""):
             logger.warning("[%s] message dropped: author not allowed by the hub in this space", self.name)
@@ -1181,6 +1199,39 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "detail": "Recorded: listed in the thread info (CI result shown in this thread when the space follows it). Nothing else to do."}
+
+    async def preview_share(self, thread: str, port: int, label: str, task_id: Optional[str]) -> Dict[str, Any]:
+        """Post the preview line (``preview.share``, answered ``preview.shared``) and remember the share with the
+        session's ``task_id``: the offers of that line start their peer in that task's terminal environment."""
+        old = self._previews.share_of(thread, port)
+        if old:
+            return {"ok": True, "msg": old["msg"], "detail": f"Already shared on port {port} in this thread. " + PREVIEW_SHARED}
+        agent = self._thread_agent.get(thread)
+        if not agent:
+            return {"ok": False, "error": "no_agent", "detail": "No message of this thread reached this agent yet: try in your next turn."}
+        try:
+            res = await self._request({"type": "preview.share", "thread": thread, "agent": agent, "port": port, "label": label})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": PREVIEW_ERRORS_TEXT.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        msg = str(res.get("msg") or "")
+        self._previews.remember(thread, port, task_id, msg, label)
+        return {"ok": True, "msg": msg, "detail": PREVIEW_SHARED}
+
+    async def preview_stop(self, thread: str, port: int) -> Dict[str, Any]:
+        """Turn the line off (``preview.stop``), forget the share and kill its open peers."""
+        share = self._previews.share_of(thread, port)
+        if not share:
+            return {"ok": False, "error": "not_shared", "detail": f"No preview shared on port {port} in this thread (or the gateway restarted since)."}
+        try:
+            await self._request({"type": "preview.stop", "thread": thread, "msg": share["msg"]})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": PREVIEW_ERRORS_TEXT.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        self._previews.forget(thread, port)
+        return {"ok": True, "detail": f"Preview of port {port} stopped: its line is off, open previews closed."}
 
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], file_name: Optional[str] = None) -> SendResult:
         fid = await self._upload(chat_id, path, file_name)
@@ -1662,6 +1713,47 @@ def pushed_commits_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("pushed_commits", thread, lambda a: a.pushed_commits(thread, commits))
 
 
+def _preview_port(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """(thread, port, None) or (None, None, error message): session and port checked before any frame."""
+    thread, err = _session_thread(tool)
+    if err:
+        return None, None, err
+    port = args.get("port")
+    if isinstance(port, str) and port.strip().isdigit():
+        port = int(port.strip())
+    if not pv.port_ok(port):
+        return None, None, f"port must be an integer from {pv.PORT_MIN} to {pv.PORT_MAX} (the port of your server on 127.0.0.1)."
+    return thread, port, None
+
+
+def preview_share_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_: Any) -> str:
+    """Tool handler: probe the port in the agent's terminal environment, then preview.share. ``task_id`` is the
+    calling session's (Hermes passes it to every handler: model_tools._execute_tool -> registry.dispatch)."""
+    from tools.registry import tool_error
+    thread, port, err = _preview_port("preview_share", args)
+    if err:
+        return tool_error(err)
+    try:
+        env = pv.task_env(task_id)
+        listening = pv.probe_port(env, port)
+    except pv.PreviewError as e:
+        return tool_error(f"cannot reach your terminal environment to check port {port}: {e}")
+    if not listening:
+        return tool_error(f"nothing answers on http://127.0.0.1:{port}/ in your terminal: start the server first (in the "
+                          "background, listening on 127.0.0.1 or 0.0.0.0), then call preview_share again.")
+    label = pv.clean_label(args.get("label"))
+    return _on_adapter("preview_share", thread, lambda a: a.preview_share(thread, port, label, task_id))
+
+
+def preview_stop_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: preview.stop of this thread's share on that port."""
+    from tools.registry import tool_error
+    thread, port, err = _preview_port("preview_stop", args)
+    if err:
+        return tool_error(err)
+    return _on_adapter("preview_stop", thread, lambda a: a.preview_stop(thread, port))
+
+
 MEMORY_REVIEW_SCHEMA = {
     "name": "memory_review",
     "description": (
@@ -2102,6 +2194,10 @@ def register(ctx) -> None:
                           description=RELEASE_SCHEMA["description"], emoji="🔓")
         ctx.register_tool(name="pushed_commits", toolset="briefling", schema=PUSHED_SCHEMA, handler=pushed_commits_tool,
                           description=PUSHED_SCHEMA["description"], emoji="🚦")
+        ctx.register_tool(name="preview_share", toolset="briefling", schema=PREVIEW_SHARE_SCHEMA, handler=preview_share_tool,
+                          description=PREVIEW_SHARE_SCHEMA["description"], emoji="🖥️")
+        ctx.register_tool(name="preview_stop", toolset="briefling", schema=PREVIEW_STOP_SCHEMA, handler=preview_stop_tool,
+                          description=PREVIEW_STOP_SCHEMA["description"], emoji="🖥️")
         ctx.register_tool(name="memory_search", toolset="briefling", schema=MEMORY_SEARCH_SCHEMA, handler=memory_search_tool,
                           description=MEMORY_SEARCH_SCHEMA["description"], emoji="🧠")
         ctx.register_tool(name="memory_read", toolset="briefling", schema=MEMORY_READ_SCHEMA, handler=memory_read_tool,

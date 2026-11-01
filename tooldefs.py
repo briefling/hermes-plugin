@@ -758,6 +758,55 @@ PUSHED_SCHEMA = {
 }
 
 
+PREVIEW_SHARE_SCHEMA = {
+    "name": "preview_share",
+    "description": (
+        "briefling only, in a thread: share a web page you serve on 127.0.0.1:<port> of your terminal (a dev server) "
+        "with the leads of the thread. Call it after starting a dev server the lead should see. A line is posted in "
+        "the thread; a lead opens the page in briefling with « Open preview » (no port is exposed, the page goes "
+        "through an encrypted peer-to-peer channel). Keep the server running in the background. Hot reload does not "
+        "go through the preview (the lead reloads the page). Stop it with preview_stop."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "port": {"type": "integer", "minimum": 1024, "maximum": 65535,
+                     "description": "Port of the server on 127.0.0.1 in your terminal, e.g. 5173."},
+            "label": {"type": "string", "maxLength": 80,
+                      "description": "Optional short name shown on the line, e.g. 'Login page (Vite)'."},
+        },
+        "required": ["port"],
+    },
+}
+
+
+PREVIEW_STOP_SCHEMA = {
+    "name": "preview_stop",
+    "description": (
+        "briefling only, in a thread: stop a preview you shared with preview_share on this port. Its line in the "
+        "thread turns off and the open previews close."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "port": {"type": "integer", "minimum": 1024, "maximum": 65535, "description": "Port given to preview_share."},
+        },
+        "required": ["port"],
+    },
+}
+
+
+PREVIEW_SHARED = ("Posted in this thread: the leads can open it with « Open preview ». Hot reload does not go through "
+                  "the preview: they reload the page to see a change. Keep the server running; the preview stops with "
+                  "preview_stop or when the gateway restarts.")
+
+
+PREVIEW_ERRORS_TEXT = {
+    "forbidden": "Only in a thread of a space this agent serves (not in the Lounge General), for your own preview.",
+    "bad_frame": "Invalid preview request (port 1024-65535, label one short line).",
+}
+
+
 MEMORY_SPACE_PARAM = {"type": "string", "description": (
     "Optional: id of another space whose memory you need (you must serve it, and the human of this turn must be a "
     "member of it). Omit for this conversation's space.")}

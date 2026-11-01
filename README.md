@@ -8,6 +8,10 @@ the hub, no inbound port.
   exec approvals map to hub frames.
 - Tools for the agent: `turn_outcome`, `propose_thread`, `propose_plan`, `propose_space_about`, `propose_issue`, `acquire_resource`,
   `release_resource`. Each one sends a typed frame; the hub applies its own gates and a human confirms.
+- `preview_share` / `preview_stop`: the agent shares a dev server of its terminal (127.0.0.1:<port>) with the thread's
+  leads, who open it in briefling over WebRTC (no inbound port). Each viewer gets one headless Chromium peer started
+  in the agent's terminal environment (needs `python3` with Playwright + Chromium there, e.g.
+  `pip install playwright && python3 -m playwright install chromium`).
 - Only messages from humans the space trusts reach the agent (checked by the hub, then again by the plugin through
   `BRIEFLING_ALLOWED_USERS`, or the hub's list with `BRIEFLING_ALLOWED_FROM=hub`, see below).
 
