@@ -1,7 +1,7 @@
 name: briefling
 label: briefling
 kind: platform
-version: 0.3.17
+version: 0.3.18
 author: opcode
 description: >
   briefling gateway adapter: one outbound WebSocket to the briefling hub (AWS).
