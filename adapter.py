@@ -177,7 +177,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.16"
+VERSION = "0.3.17"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1205,15 +1205,17 @@ class BrieflingAdapter(BasePlatformAdapter):
         """Post the preview line (``preview.share``, answered ``preview.shared``) and remember the share with the
         terminal environment resolved in the agent's turn (``env``): the offers of that line start their peer there,
         and only while that environment is still alive (``preview.session_env``)."""
+        what = f"device {port}" if isinstance(port, str) else f"port {port}"
         old = self._previews.share_of(thread, port)
         if old:
             old["env"], old["ctx"] = env, ctx  # a share again (e.g. after its sandbox restarted) points at the live environment
-            return {"ok": True, "msg": old["msg"], "detail": f"Already shared on port {port} in this thread. " + PREVIEW_SHARED}
+            return {"ok": True, "msg": old["msg"], "detail": f"Already shared ({what}) in this thread. " + PREVIEW_SHARED}
         agent = self._thread_agent.get(thread)
         if not agent:
             return {"ok": False, "error": "no_agent", "detail": "No message of this thread reached this agent yet: try in your next turn."}
         try:
-            res = await self._request({"type": "preview.share", "thread": thread, "agent": agent, "port": port, "label": label})
+            target = {"device": port} if isinstance(port, str) else {"port": port}
+            res = await self._request({"type": "preview.share", "thread": thread, "agent": agent, **target, "label": label})
         except HubRefused as e:
             return {"ok": False, "error": e.code, "detail": PREVIEW_ERRORS_TEXT.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
@@ -1226,7 +1228,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         """Turn the line off (``preview.stop``), forget the share and kill its open peers."""
         share = self._previews.share_of(thread, port)
         if not share:
-            return {"ok": False, "error": "not_shared", "detail": f"No preview shared on port {port} in this thread (or the gateway restarted since)."}
+            what = f"device {port}" if isinstance(port, str) else f"port {port}"
+            return {"ok": False, "error": "not_shared", "detail": f"No preview shared ({what}) in this thread (or the gateway restarted since)."}
         try:
             await self._request({"type": "preview.stop", "thread": thread, "msg": share["msg"]})
         except HubRefused as e:
@@ -1234,7 +1237,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         self._previews.forget(thread, port)
-        return {"ok": True, "detail": f"Preview of port {port} stopped: its line is off, open previews closed."}
+        what = f"device {port}" if isinstance(port, str) else f"port {port}"
+        return {"ok": True, "detail": f"Preview ({what}) stopped: its line is off, open previews closed."}
 
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], file_name: Optional[str] = None) -> SendResult:
         fid = await self._upload(chat_id, path, file_name)
@@ -1716,12 +1720,19 @@ def pushed_commits_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("pushed_commits", thread, lambda a: a.pushed_commits(thread, commits))
 
 
-def _preview_port(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[str]]:
-    """(thread, port, None) or (None, None, error message): session and port checked before any frame."""
+def _preview_port(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Any, Optional[str]]:
+    """(thread, target, None) or (None, None, error message): session and target checked before any frame. The target
+    is the port (int) of a web preview or the adb serial (str) of a screen share: exactly one of the two."""
     thread, err = _session_thread(tool)
     if err:
         return None, None, err
-    port = args.get("port")
+    port, device = args.get("port"), args.get("device")
+    if device not in (None, ""):
+        if port not in (None, ""):
+            return None, None, "give either port (a web page) or device (an Android screen), not both."
+        if not pv.device_ok(device):
+            return None, None, "device must be an adb serial as `adb devices` lists it (letters, digits, . _ : -)."
+        return thread, device, None
     if isinstance(port, str) and port.strip().isdigit():
         port = int(port.strip())
     if not pv.port_ok(port):
@@ -1736,6 +1747,18 @@ def preview_share_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_:
     thread, port, err = _preview_port("preview_share", args)
     if err:
         return tool_error(err)
+    if isinstance(port, str):  # a screen: the device must be online for adb in the agent's terminal
+        try:
+            env = pv.task_env(task_id)
+            state = pv.probe_device(env, port)
+        except pv.PreviewError as e:
+            return tool_error(f"cannot reach your terminal environment to check device {port}: {e}")
+        if state != "device":
+            return tool_error(f"adb in your terminal does not see {port} online ({state}): connect it first "
+                              f"(e.g. `adb connect {port}`, check `adb devices`), then call preview_share again.")
+        label = pv.clean_label(args.get("label"))
+        ctx = contextvars.copy_context()
+        return _on_adapter("preview_share", thread, lambda a: a.preview_share(thread, port, label, task_id, env, ctx))
     try:
         env = pv.task_env(task_id)
         listening = pv.probe_port(env, port)

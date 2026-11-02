@@ -765,17 +765,22 @@ PREVIEW_SHARE_SCHEMA = {
         "with the leads of the thread. Call it after starting a dev server the lead should see. A line is posted in "
         "the thread; a lead opens the page in briefling with « Open preview » (no port is exposed, the page goes "
         "through an encrypted peer-to-peer channel). Keep the server running in the background. Hot reload does not "
-        "go through the preview (the lead reloads the page). Stop it with preview_stop."
+        "go through the preview (the lead reloads the page). Stop it with preview_stop. "
+        "To share an ANDROID SCREEN instead (emulator or device reachable by `adb` in your terminal), pass `device` "
+        "(its adb serial, as `adb devices` lists it) and no port: the lead sees the screen live and taps, swipes and "
+        "types on it."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "port": {"type": "integer", "minimum": 1024, "maximum": 65535,
-                     "description": "Port of the server on 127.0.0.1 in your terminal, e.g. 5173."},
+                     "description": "Port of the server on 127.0.0.1 in your terminal, e.g. 5173. Not with device."},
+            "device": {"type": "string", "maxLength": 64,
+                       "description": "adb serial of an Android device to share its screen, e.g. 'emulator-5554' or "
+                                      "'host.docker.internal:5555'. Not with port."},
             "label": {"type": "string", "maxLength": 80,
                       "description": "Optional short name shown on the line, e.g. 'Login page (Vite)'."},
         },
-        "required": ["port"],
     },
 }
 
@@ -783,15 +788,15 @@ PREVIEW_SHARE_SCHEMA = {
 PREVIEW_STOP_SCHEMA = {
     "name": "preview_stop",
     "description": (
-        "briefling only, in a thread: stop a preview you shared with preview_share on this port. Its line in the "
-        "thread turns off and the open previews close."
+        "briefling only, in a thread: stop a preview you shared with preview_share on this port (or this device for "
+        "a screen). Its line in the thread turns off and the open previews close."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "port": {"type": "integer", "minimum": 1024, "maximum": 65535, "description": "Port given to preview_share."},
+            "device": {"type": "string", "maxLength": 64, "description": "Device given to preview_share (a screen)."},
         },
-        "required": ["port"],
     },
 }
 
@@ -803,7 +808,7 @@ PREVIEW_SHARED = ("Posted in this thread: the leads can open it with « Open pre
 
 PREVIEW_ERRORS_TEXT = {
     "forbidden": "Only in a thread of a space this agent serves (not in the Lounge General), for your own preview.",
-    "bad_frame": "Invalid preview request (port 1024-65535, label one short line).",
+    "bad_frame": "Invalid preview request (port 1024-65535 or an adb serial, label one short line).",
 }
 
 

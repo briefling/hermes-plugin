@@ -32,12 +32,14 @@ SDP_MAX = 16_384                          # protocol/preview.ts PREVIEW_SDP_MAX
 CANDIDATE_MAX = 1024                      # protocol/preview.ts PREVIEW_CANDIDATE_MAX
 SESSION_RE = re.compile(r"[A-Za-z0-9_-]{22,64}")  # protocol/preview.ts PREVIEW_SESSION_RE (fullmatch)
 PREVIEW_ERRORS = ("not_shared", "not_connected", "preview_off", "gone", "no_browser", "port_closed", "busy",
-                  "peer_failed", "timeout")  # protocol/preview.ts PREVIEW_ERRORS
+                  "peer_failed", "timeout", "no_device", "no_scrcpy")  # protocol/preview.ts PREVIEW_ERRORS
+DEVICE_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}")  # protocol/preview.ts PREVIEW_DEVICE_RE (fullmatch)
 MAX_PEERS = 3
 PEER_MAX_S = 30 * 60
 PROBE_TIMEOUT_S = 15                      # docker exec + python start, the probe itself waits 1 s
 LOG_LINE_MAX = 200
 PEER_SOURCE = (Path(__file__).with_name("preview_peer.py")).read_text(encoding="utf-8")
+SCREEN_PEER_SOURCE = (Path(__file__).with_name("screen_peer.py")).read_text(encoding="utf-8")
 PROBE_OK = "BRIEFLING_PROBE_OK"
 # Any HTTP answer (404, 500 included) means something listens; refused/timeout means nothing does.
 PROBE_PY = (
@@ -62,6 +64,16 @@ class PreviewError(Exception):
 
 def port_ok(x: Any) -> bool:
     return isinstance(x, int) and not isinstance(x, bool) and PORT_MIN <= x <= PORT_MAX
+
+
+def device_ok(x: Any) -> bool:
+    """An adb serial: no shell character (it is quoted anyway where a command line carries it)."""
+    return isinstance(x, str) and DEVICE_RE.fullmatch(x) is not None
+
+
+def target_ok(x: Any) -> bool:
+    """What a share points at: a port (web page) or an adb serial (screen)."""
+    return port_ok(x) or device_ok(x)
 
 
 def clean_label(x: Any) -> str:
@@ -209,8 +221,22 @@ def probe_port(env, port: int) -> bool:
     return PROBE_OK in (out or "")
 
 
-def peer_command(tag: str) -> str:
-    return f"python3 -c {shlex.quote(PEER_SOURCE)} {tag}"
+def probe_device(env, device: str) -> str:
+    """`adb -s <device> get-state` in the agent's environment: 'device' when online, else what adb said (one line,
+    bounded) or 'no adb'."""
+    cmd = f"command -v adb >/dev/null || {{ echo 'no adb'; exit 0; }}; adb -s {shlex.quote(device)} get-state 2>&1 | head -n 1"
+    proc = spawn_in_env(env, cmd, timeout=PROBE_TIMEOUT_S)
+    try:
+        out = proc.stdout.read() if hasattr(proc.stdout, "read") else "".join(proc.stdout)
+        proc.wait(timeout=PROBE_TIMEOUT_S)
+    except Exception:
+        _kill(env, proc)
+        return "no answer"
+    return re.sub(r"[\x00-\x1f]+", " ", out or "").strip()[:LOG_LINE_MAX] or "no answer"
+
+
+def peer_command(tag: str, screen: bool = False) -> str:
+    return f"python3 -c {shlex.quote(SCREEN_PEER_SOURCE if screen else PEER_SOURCE)} {tag}"
 
 
 def _kill(env, proc) -> None:
@@ -248,7 +274,7 @@ def kill_peer(env, proc, tag: str) -> None:
 class Peer:
     ctx: Any = None  # the share's turn context (in_turn_context)
 
-    def __init__(self, session: str, thread: str, port: int, msg: str, tag: str):
+    def __init__(self, session: str, thread: str, port: Any, msg: str, tag: str):  # port: int, or the device (str) of a screen
         self.session, self.thread, self.port, self.msg, self.tag = session, thread, port, msg, tag
         self.env: Any = None
         self.proc: Any = None
@@ -268,7 +294,7 @@ class Previews:
     def __init__(self, send: Callable[[Dict[str, Any]], Any]):
         self.send = send
         self.loop: Any = None
-        self.shares: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self.shares: Dict[Tuple[str, Any], Dict[str, Any]] = {}  # (thread, port or device)
         self.peers: Dict[str, Peer] = {}
         self.lock = threading.Lock()
         self.session_env = session_env    # seams for the tests
@@ -276,15 +302,15 @@ class Previews:
         self.kill = kill_peer
 
     # shares
-    def share_of(self, thread: str, port: int) -> Optional[Dict[str, Any]]:
+    def share_of(self, thread: str, port: Any) -> Optional[Dict[str, Any]]:
         return self.shares.get((thread, port))
 
-    def remember(self, thread: str, port: int, task_id: Optional[str], msg: str, label: str, env: Any = None, ctx: Any = None) -> None:
+    def remember(self, thread: str, port: Any, task_id: Optional[str], msg: str, label: str, env: Any = None, ctx: Any = None) -> None:
         # env: the agent's terminal environment, resolved in its turn (see session_env); ctx: that turn's context
         # (see in_turn_context), under which every later step on that environment runs.
         self.shares[(thread, port)] = {"task_id": task_id, "msg": msg, "label": label, "env": env, "ctx": ctx}
 
-    def forget(self, thread: str, port: int) -> Optional[Dict[str, Any]]:
+    def forget(self, thread: str, port: Any) -> Optional[Dict[str, Any]]:
         share = self.shares.pop((thread, port), None)
         if share:
             for p in [p for p in list(self.peers.values()) if p.thread == thread and p.port == port]:
@@ -295,12 +321,15 @@ class Previews:
     async def offer(self, frame: Dict[str, Any]) -> None:
         import asyncio
         self.loop = asyncio.get_running_loop()
-        session, thread, msg, port = frame.get("session"), frame.get("thread"), frame.get("msg"), frame.get("port")
+        session, thread, msg = frame.get("session"), frame.get("thread"), frame.get("msg")
+        # A screen offer carries the device instead of the port (protocol/preview.ts); the share is keyed by either.
+        port = frame.get("device") if "device" in frame else frame.get("port")
+        screen = isinstance(port, str)
         if not (isinstance(session, str) and SESSION_RE.fullmatch(session)):
             return
         if session in self.peers:
             return  # a duplicate offer of a running session
-        share = self.share_of(thread, port) if isinstance(thread, str) and port_ok(port) else None
+        share = self.share_of(thread, port) if isinstance(thread, str) and target_ok(port) else None
         if share is None or share["msg"] != msg:
             return await self._failed(session, "gone")
         sdp, ice = frame.get("sdp"), frame.get("ice")
@@ -316,12 +345,12 @@ class Previews:
         if busy:
             return await self._failed(session, "busy")
         # The TURN credentials (ice) travel on stdin only; the command line carries the source and a random tag.
-        stdin = json.dumps({"port": port, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)],
+        stdin = json.dumps({("device" if screen else "port"): port, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)],
                             "max_s": PEER_MAX_S}) + "\n"
         try:
             peer.ctx = ctx = share.get("ctx")
             peer.env = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.session_env(share.get("env"))))
-            peer.proc = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.spawn(peer.env, peer_command(peer.tag), stdin)))
+            peer.proc = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.spawn(peer.env, peer_command(peer.tag, screen), stdin)))
         except PreviewError as e:
             logger.warning("[briefling] preview peer not started: %s", e)
             self.peers.pop(session, None)
@@ -335,7 +364,7 @@ class Previews:
             return
         peer.timer = self.loop.call_later(PEER_MAX_S, self.close, session)
         threading.Thread(target=self._read, args=(peer,), daemon=True, name=f"preview-{peer.tag}").start()
-        logger.info("[briefling] preview peer started for port %d (%d live)", port, len(self.peers))
+        logger.info("[briefling] preview peer started for %s (%d live)", f"device {port}" if screen else f"port {port}", len(self.peers))
 
     def _read(self, peer: Peer) -> None:
         """Peer stdout, in its own thread: JSON lines become frames, anything else is a log line (never forwarded)."""
