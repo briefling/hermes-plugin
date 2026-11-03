@@ -57,3 +57,9 @@ connection and again on every settings save, applied at once (no restart). Choos
 the hub as much as the host. Then leave `BRIEFLING_ALLOWED_USERS` and `GATEWAY_ALLOWED_USERS` empty: Hermes checks an
 environment list first. Until the hub's list arrives, nobody is allowed.
 
+## Cron jobs: a report as a new Lounge topic
+
+`deliver=briefling:<space id>` on a cron job opens a topic in that space's Lounge with the job's output as its first
+message, signed by the agent; the members are notified and the topic shows as a card in the Lounge feed. The hub
+caps it (10 topics per agent and space per day) and never lets an agent write in General. A bare `deliver=briefling`
+is refused: the home channel is `off`. `deliver=origin` from a job created in a topic still answers in that topic.

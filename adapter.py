@@ -181,7 +181,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.26"
+VERSION = "0.3.27"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -592,6 +592,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                     logger.warning("[briefling] BRIEFLING_ALLOWED_FROM=hub but %s is set: the gateway checks that list "
                                    "first, remove it to follow the hub", env)
         self._thread_space: Dict[str, str] = {}  # thread -> space (needed to upload a file into it)
+        self._hub_spaces: set = set()  # spaces the hub opened on the last `subscribed`: `send(<space>)` opens a topic there
         self._waiting: Dict[str, asyncio.Future] = {}  # client_id -> future(upload.ready / ack frame)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_turn_at: Dict[str, int] = {}
@@ -804,6 +805,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         elif kind == "allowed":
             self._on_allowed(frame.get("space"), frame.get("users"))
         elif kind == "subscribed":
+            self._hub_spaces = {s for s in frame.get("spaces") or [] if isinstance(s, str)}
             if isinstance(frame.get("allowed"), dict):  # a new connection: the hub's lists replace the old ones
                 self._hub_allowed = {}
                 for space, users in frame["allowed"].items():
@@ -971,6 +973,11 @@ class BrieflingAdapter(BasePlatformAdapter):
         if reply_to and reply_to in self._stop_ids:  # the gateway's reply to our /stop: the hub's line says it
             self._stop_ids.discard(reply_to)
             return SendResult(success=True, message_id=None)
+        # A space instead of a conversation (cron `deliver=briefling:<space>`): the agent opens a Lounge topic on its own.
+        if chat_id in self._hub_spaces and chat_id not in self._thread_space:
+            return await self._open_topic(chat_id, content)
+        if chat_id in ("", "off"):  # bare `deliver=briefling`: BRIEFLING_HOME_CHANNEL=off, no home conversation
+            return SendResult(success=False, message_id=None, error="briefling has no home channel: use deliver=briefling:<space id>")
         msg_id = new_id()
         frame: Dict[str, Any] = {"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": content[:MAX_TEXT], "rev": self._next_rev()}
         notice = is_notice(content, metadata)
@@ -980,6 +987,19 @@ class BrieflingAdapter(BasePlatformAdapter):
         if not notice:  # a gateway notice is not an answer: it must not unlock turn_outcome waiting
             self._mark_spoke(chat_id, content, ok)
         return SendResult(success=ok, message_id=msg_id if ok else None, error=None if ok else "hub not connected")
+
+    async def _open_topic(self, space: str, content: str) -> SendResult:
+        """`topic.open`: a Lounge topic in `space` whose first message is `content`, signed by this agent (the hub caps
+        them per day and never writes in General). Returns the topic's first message id."""
+        try:
+            ack = await self._request({"type": "topic.open", "space": space, "text": content[:MAX_TEXT]})
+        except HubRefused as e:
+            return SendResult(success=False, message_id=None, error=f"hub refused the topic: {e.code}")
+        except (ConnectionError, asyncio.TimeoutError) as e:
+            return SendResult(success=False, message_id=None, error=f"hub not reached: {type(e).__name__}")
+        if isinstance(ack.get("thread"), str):
+            self._thread_space[ack["thread"]] = space
+        return SendResult(success=True, message_id=ack.get("msg_id"))
 
     async def _upload(self, chat_id: str, path: str, file_name: Optional[str] = None) -> Optional[str]:
         """Upload a local file into the thread's space through a presigned S3 form; returns the file id."""
@@ -2253,6 +2273,9 @@ def register(ctx) -> None:
         install_hint="aiohttp is already a Hermes dependency",
         env_enablement_fn=_env_enablement,
         allowed_users_env="BRIEFLING_ALLOWED_USERS",
+        # Valid cron target: `deliver=briefling:<space id>` opens a Lounge topic there (send). The home channel itself is
+        # `off` (join.py): a bare `deliver=briefling` is refused by send, never posted somewhere arbitrary.
+        cron_deliver_env_var="BRIEFLING_HOME_CHANNEL",
         max_message_length=MAX_TEXT, emoji="☕",
         platform_hint=(
             "You are talking in briefling, a desktop app where each conversation (a 'thread') is one "
