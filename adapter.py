@@ -177,7 +177,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.19"
+VERSION = "0.3.20"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -481,18 +481,22 @@ def voice_hint(files: Any) -> str:
     return VOICE_HINT if any(is_recording(f) for f in (files if isinstance(files, list) else [])) else ""
 
 
-def inbound_type(own: Any, kept: List[Dict[str, Any]]) -> MessageType:
+def inbound_type(own: Any, kept: List[Dict[str, Any]], author: str = "") -> MessageType:
     """Gateway type of a delivered message. `own`: the message's own files; `kept`: the downloaded files (its own
-    and its context's). VOICE makes the gateway transcribe EVERY audio of the event before the turn, so it is only
-    used when each kept audio is a recording of this very message; any other audio (a dropped mp3, an older note
-    from the context) keeps the whole event a DOCUMENT: files handed to the agent, no automatic transcription."""
+    and those of the unseen messages before it, each with `by` = its message's author); `author`: the message's
+    author, a trusted human (checked before). VOICE makes the gateway transcribe EVERY audio of the event before the
+    turn, so it is only used when each kept audio is a recording by that same author (a voice note then « @agent » in
+    the next message); any other audio (a dropped mp3, another member's note) keeps the whole event a DOCUMENT: files
+    handed to the agent, no automatic transcription. A file without `by` (older hub) counts only if it is the
+    message's own."""
     if not kept:
         return MessageType.TEXT
     if all(str(f.get("mime") or "").startswith("image/") for f in kept):
         return MessageType.PHOTO
     mine = {f.get("id") for f in (own if isinstance(own, list) else []) if is_recording(f)}
+    ours = lambda f: (bool(author) and f["by"] == author) if "by" in f else f.get("id") in mine
     audio = [f for f in kept if str(f.get("mime") or "").startswith("audio/")]
-    if audio and all(is_recording(f) and f.get("id") in mine for f in audio):
+    if audio and all(is_recording(f) and ours(f) for f in audio):
         return MessageType.VOICE
     return MessageType.DOCUMENT
 
@@ -830,9 +834,11 @@ class BrieflingAdapter(BasePlatformAdapter):
         author = msg.get("author") or {}
         # A gateway command (/approve, /stop...) must stay verbatim: prefixed with context it is no
         # longer a command and, during a turn, the gateway takes it as a redirect of the running run.
+        media_urls, media_types, kept = await self._download_files(frame.get("files") or [])
+        msg_type = inbound_type(msg.get("files"), kept, str(author.get("id") or ""))
         if not MessageEvent(text=text).get_command():
             text = with_context(frame.get("context") or {},
-                                vault.hint(thread) + edit_hint(msg) + voice_hint(msg.get("files")) + text)
+                                vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + text)
         source = self.build_source(
             chat_id=thread, chat_name=self._titles[thread], chat_type="dm",
             user_id=str(author.get("id") or ""), user_name=str(frame.get("author_name") or author.get("id") or ""), message_id=msg_id)
@@ -840,8 +846,6 @@ class BrieflingAdapter(BasePlatformAdapter):
             ts = datetime.fromtimestamp(int(msg.get("at")) / 1000, tz=timezone.utc)
         except (TypeError, ValueError, OSError):
             ts = datetime.now(tz=timezone.utc)
-        media_urls, media_types, kept = await self._download_files(frame.get("files") or [])
-        msg_type = inbound_type(msg.get("files"), kept)
         await self.handle_message(MessageEvent(
             text=text.strip(), message_type=msg_type, source=source, message_id=msg_id, raw_message=frame, timestamp=ts,
             media_urls=media_urls, media_types=media_types))
