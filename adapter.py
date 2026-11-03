@@ -177,7 +177,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.18"
+VERSION = "0.3.19"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -464,18 +464,37 @@ class HubRefused(Exception):
 # Voice note recorded with the composer's mic button: the client names it `audio-YYYY-MM-DD-HHMM.<ext>` (recName in
 # client/src/audio.ts). Any other audio (a dropped mp3, a call recording) gets no hint: an audio is not necessarily a voice.
 RECORDING_RE = re.compile(r"audio-\d{4}-\d{2}-\d{2}-\d{4}\.(?:webm|m4a|ogg|mp3|wav|audio)")
-VOICE_HINT = ("[The human sent a voice note recorded in briefling (attached audio file). Answer in text as usual; "
-              "if you have a text-to-speech tool, add after your text a short spoken summary of your answer "
-              "(2 or 3 sentences, same language), sent as audio.]\n")
+VOICE_HINT = ("[The human sent a voice note recorded in briefling. Answer what it says, in text as usual: the gateway "
+              "gives you its transcript; if it could not transcribe it, the audio file path is given instead, "
+              "transcribe it yourself. If you have a text-to-speech tool, add after your text a short spoken summary "
+              "of your answer (2 or 3 sentences, same language), sent as audio.]\n")
+
+
+def is_recording(f: Any) -> bool:
+    """A voice note from the composer's mic button (an audio is not necessarily a voice)."""
+    return (isinstance(f, dict) and str(f.get("mime") or "").startswith("audio/")
+            and bool(RECORDING_RE.fullmatch(str(f.get("name") or ""))))
 
 
 def voice_hint(files: Any) -> str:
     """Hidden nudge: a voice note gets a text answer plus, when the agent can, a short audio summary."""
-    for f in files if isinstance(files, list) else []:
-        if (isinstance(f, dict) and str(f.get("mime") or "").startswith("audio/")
-                and RECORDING_RE.fullmatch(str(f.get("name") or ""))):
-            return VOICE_HINT
-    return ""
+    return VOICE_HINT if any(is_recording(f) for f in (files if isinstance(files, list) else [])) else ""
+
+
+def inbound_type(own: Any, kept: List[Dict[str, Any]]) -> MessageType:
+    """Gateway type of a delivered message. `own`: the message's own files; `kept`: the downloaded files (its own
+    and its context's). VOICE makes the gateway transcribe EVERY audio of the event before the turn, so it is only
+    used when each kept audio is a recording of this very message; any other audio (a dropped mp3, an older note
+    from the context) keeps the whole event a DOCUMENT: files handed to the agent, no automatic transcription."""
+    if not kept:
+        return MessageType.TEXT
+    if all(str(f.get("mime") or "").startswith("image/") for f in kept):
+        return MessageType.PHOTO
+    mine = {f.get("id") for f in (own if isinstance(own, list) else []) if is_recording(f)}
+    audio = [f for f in kept if str(f.get("mime") or "").startswith("audio/")]
+    if audio and all(is_recording(f) and f.get("id") in mine for f in audio):
+        return MessageType.VOICE
+    return MessageType.DOCUMENT
 
 
 # An edited message (↑ in the client, `message.edited` = hub time of the edit) comes again with the same id: the agent
@@ -821,10 +840,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             ts = datetime.fromtimestamp(int(msg.get("at")) / 1000, tz=timezone.utc)
         except (TypeError, ValueError, OSError):
             ts = datetime.now(tz=timezone.utc)
-        media_urls, media_types = await self._download_files(frame.get("files") or [])
-        msg_type = MessageType.TEXT
-        if media_types:
-            msg_type = MessageType.PHOTO if all(m.startswith("image/") for m in media_types) else MessageType.DOCUMENT
+        media_urls, media_types, kept = await self._download_files(frame.get("files") or [])
+        msg_type = inbound_type(msg.get("files"), kept)
         await self.handle_message(MessageEvent(
             text=text.strip(), message_type=msg_type, source=source, message_id=msg_id, raw_message=frame, timestamp=ts,
             media_urls=media_urls, media_types=media_types))
@@ -888,10 +905,12 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._stop_tasks.add(task)
         task.add_done_callback(self._stop_tasks.discard)
 
-    async def _download_files(self, files: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
-        """Download attachments from their presigned S3 URLs into the Hermes media cache."""
+    async def _download_files(self, files: List[Dict[str, Any]]) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+        """Download attachments from their presigned S3 URLs into the Hermes media cache → (paths, mimes, kept
+        file entries, same order)."""
         urls: List[str] = []
         types: List[str] = []
+        kept: List[Dict[str, Any]] = []
         # The hub sends them oldest first (the message's own last): over the cap, keep the most recent.
         for f in files[-MAX_FILES:]:
             url, mime, name = f.get("url"), str(f.get("mime") or "application/octet-stream"), str(f.get("name") or "file")
@@ -916,9 +935,10 @@ class BrieflingAdapter(BasePlatformAdapter):
                     path = await cache_document_from_bytes_async(data, name)
                 urls.append(path)
                 types.append(mime)
+                kept.append(f)
             except Exception as e:  # one bad file must not drop the message
                 logger.warning("[%s] attachment download failed: %s", self.name, type(e).__name__)
-        return urls, types
+        return urls, types, kept
 
     # -- outbound ------------------------------------------------------------
 
