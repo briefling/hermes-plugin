@@ -98,6 +98,7 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import MessageDeduplicator
 
+from .activity import aux_activity, call_activity
 from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
 from .flowswitch import SwitchError, parse_link
 from . import vault
@@ -177,7 +178,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.21"
+VERSION = "0.3.22"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -327,9 +328,19 @@ def merge_cost_status(a: str, b: str) -> str:
 
 def add_usage(total: Optional[Dict[str, Any]], call: Dict[str, Any]) -> Dict[str, Any]:
     if not total:
-        return dict(call)
+        out = dict(call)
+        if call.get("activity"):
+            out["activity"] = {k: dict(v) for k, v in call["activity"].items()}
+        return out
     out = {k: total[k] + call[k] for k in ("usd", "calls", *(f for f, _ in _TOKEN_FIELDS))}
     out["status"] = merge_cost_status(total["status"], call["status"])
+    act = {k: dict(v) for k, v in (total.get("activity") or {}).items()}
+    for k, v in (call.get("activity") or {}).items():
+        a = act.setdefault(k, {"usd": 0.0, "calls": 0})
+        a["usd"] += v["usd"]
+        a["calls"] += v["calls"]
+    if act:
+        out["activity"] = act
     return out
 
 
@@ -364,13 +375,15 @@ def _usage_thread() -> Optional[str]:
     return thread if thread and any(thread in a._thread_space for a in list(_ADAPTERS)) else None
 
 
-def _record_usage(model: Any, usage: Any, provider: Any, base_url: Any) -> None:
+def _record_usage(model: Any, usage: Any, provider: Any, base_url: Any, activity: str = "other") -> None:
     if not isinstance(usage, dict):
         return  # error, streamed aux attempt, provider without usage
     thread = _usage_thread()
     if not thread:
         return
     call = price_call(model, usage, provider, base_url)
+    # what the call was for (category only, never the command): turn.ended.usage.activity
+    call["activity"] = {activity: {"usd": call["usd"], "calls": 1}}
     with _usage_lock:
         _usage[thread] = add_usage(_usage.get(thread), call)
 
@@ -400,7 +413,8 @@ def on_post_api_request(**kw: Any) -> None:
         logger.debug("briefling: post_api_request step count failed", exc_info=True)
     try:
         # agent.model, like Hermes' session pricing (response_model can be a dated alias with no price entry)
-        _record_usage(kw.get("model"), kw.get("usage"), kw.get("provider"), kw.get("base_url"))
+        _record_usage(kw.get("model"), kw.get("usage"), kw.get("provider"), kw.get("base_url"),
+                      call_activity(kw.get("assistant_message"), kw.get("platform")))
     except Exception:
         logger.debug("briefling: post_api_request accounting failed", exc_info=True)
 
@@ -410,7 +424,8 @@ def on_post_auxiliary_call(**kw: Any) -> None:
         if kw.get("aux_task") in _AUX_EXCLUDED or kw.get("error_type"):
             return
         # served model (after aux fallback), like Hermes' record_aux_usage
-        _record_usage(kw.get("response_model") or kw.get("model"), kw.get("usage"), kw.get("provider"), kw.get("base_url"))
+        _record_usage(kw.get("response_model") or kw.get("model"), kw.get("usage"), kw.get("provider"), kw.get("base_url"),
+                      aux_activity(kw.get("aux_task")))
     except Exception:
         logger.debug("briefling: post_auxiliary_call accounting failed", exc_info=True)
 
@@ -446,6 +461,8 @@ def take_usage(thread: str) -> Optional[Dict[str, Any]]:
         u = _usage.pop(thread, None)
     if u:
         u["usd"] = round(u["usd"], 6)
+        for a in (u.get("activity") or {}).values():
+            a["usd"] = round(a["usd"], 6)
     return u
 
 
