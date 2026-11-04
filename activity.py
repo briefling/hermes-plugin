@@ -10,10 +10,9 @@ import json
 import re
 from typing import Any, Iterable, List, Optional, Tuple
 
-ACTIVITIES = ("answer", "read", "code", "test", "deploy", "git", "delegate", "coordination", "review", "compress",
-              "other")
+ACTIVITIES = ("answer", "read", "code", "test", "deploy", "git", "coordination", "review", "compress", "other")
 
-_PRIORITY = ("deploy", "test", "code", "git", "delegate", "read", "coordination", "answer", "other")
+_PRIORITY = ("deploy", "test", "code", "git", "read", "coordination", "answer", "other")
 
 _READ_TOOLS = frozenset({
     "read_file", "search_files", "web_search", "web_extract", "vision_analyze", "skill_view", "skills_list",
@@ -21,10 +20,10 @@ _READ_TOOLS = frozenset({
 })
 _CODE_TOOLS = frozenset({"patch", "write_file"})
 _SHELL_TOOLS = frozenset({"terminal"})
-_DELEGATE_TOOLS = frozenset({"delegate_task"})
 # Keeping the work in step with the others and with itself: locks, board, project memory, background processes,
-# task lists, schedules, skills (outside the background review, which has its own category).
+# task lists, schedules, skills (outside the background review, which has its own category), starting sub-agents.
 _COORDINATION_TOOLS = frozenset({
+    "delegate_task",
     "acquire_resource", "release_resource", "pushed_commits", "flow_switch",
     "board_comment", "board_label", "board_move", "board_set", "board_status",
     "memory_propose", "memory_review", "memory_compact", "memory_tag", "memory_tag_merge", "memory",
@@ -134,8 +133,6 @@ def tool_activity(name: str, args: Any = None) -> str:
         return "read"
     if name in _CODE_TOOLS:
         return "code"
-    if name in _DELEGATE_TOOLS:
-        return "delegate"
     if name in _COORDINATION_TOOLS:
         return "coordination"
     if name in _ANSWER_TOOLS:
@@ -169,11 +166,10 @@ def in_background_review() -> bool:
 
 def call_activity(assistant_message: Any, platform: Optional[str] = None, review: Optional[bool] = None) -> str:
     """Category of one main-loop call (``post_api_request``). Every call of the background review counts as
-    ``review``, a sub-agent's as ``delegate``; a call that decides no tool writes the answer."""
+    ``review``; a sub-agent's call (``platform == "subagent"``) counts by what it does, like the parent's. A call that
+    decides no tool writes the answer. ``platform`` is kept for the hook's signature."""
     if review if review is not None else in_background_review():
         return "review"
-    if platform == "subagent":
-        return "delegate"
     calls = _tool_calls(assistant_message) if assistant_message is not None else []
     if not calls:
         return "answer"
