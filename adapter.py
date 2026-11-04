@@ -104,6 +104,7 @@ from .activity import aux_activity, call_activity
 from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
 from .flowswitch import SwitchError, parse_link
 from . import vault
+from . import background
 from . import preview as pv
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
@@ -196,7 +197,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.31"
+VERSION = "0.3.32"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -628,6 +629,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._flow_turns: Dict[str, FlowHost] = {}    # thread -> host whose task turn runs there
         self._flow_ended: Dict[str, int] = {}         # thread -> end (s) of its last turn: the task's sign of life
         self._flow_loop_task: Optional[asyncio.Task] = None
+        self._bg = background.Tracker()  # what the hub was last told of each thread's background work
+        self._bg_task: Optional[asyncio.Task] = None
         self._flow_config_lock = asyncio.Lock()       # one bundle written at a time
         # Secrets (briefling/vault.py): key pair in memory only, new at every gateway start; None = feature off.
         self._secret_key = vault.new_key()
@@ -664,6 +667,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._task = asyncio.create_task(self._run())
         if self._flow_spaces:
             self._start_flow()
+        self._bg_task = asyncio.create_task(self._bg_loop())
         self._mark_connected()
         self._wire_plugin_handlers(None)
         return True
@@ -677,6 +681,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         if self._flow_loop_task:
             self._flow_loop_task.cancel()
             self._flow_loop_task = None
+        if getattr(self, "_bg_task", None):
+            self._bg_task.cancel()
+            self._bg_task = None
         if self._task:
             self._task.cancel()
             try:
@@ -1484,6 +1491,33 @@ class BrieflingAdapter(BasePlatformAdapter):
             if usage and not sent:
                 give_back_usage(thread, usage)
             self._flow_turn_ended(thread, str(getattr(event, "message_id", "") or ""), usage if sent else None)
+
+    # -- background work (sub-agents, notified processes): thread.background ----------------------
+
+    async def _bg_loop(self) -> None:
+        """Reads the registries every SCAN_S while the hub is reachable; frames on change, beat or end (background.py)."""
+        while self._running:
+            try:
+                await self._opened.wait()
+                await self._bg_scan()
+                await asyncio.sleep(background.SCAN_S)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.warning("[%s] background scan error", self.name, exc_info=True)
+                await asyncio.sleep(background.SCAN_S)
+
+    async def _bg_scan(self) -> int:
+        prefix = background.key_prefix(getattr(self, "_owner_profile", None))
+        # off the loop: list_async_delegations samples each child's progress
+        current = await asyncio.get_running_loop().run_in_executor(None, background.collect, prefix)
+        sent = 0
+        now = time.time()
+        for thread, tasks in self._bg.due(current, list(self._thread_space), now):
+            if await self._send_frame({"type": "thread.background", "thread": thread, "tasks": tasks}):
+                self._bg.sent(thread, tasks, now)
+                sent += 1
+        return sent
 
     # -- flow ------------------------------------------------------------------
 
