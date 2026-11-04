@@ -969,7 +969,11 @@ PREVIEW_SHARE_SCHEMA = {
         "terminal (it hits the lead's own machine). Stop it with preview_stop. "
         "To share an ANDROID SCREEN instead (emulator or device reachable by `adb` in your terminal), pass `device` "
         "(its adb serial, as `adb devices` lists it) and no port: the lead sees the screen live and taps, swipes and "
-        "types on it."
+        "types on it. "
+        "To open a VOICE channel instead (the lead talks, you get transcripts as the lead's messages and your replies "
+        "are spoken), start the local voice daemon in the background (python -m briefling_voice.daemon --url-file "
+        "<path>) and pass `voice` = the daemon's url-file path; never paste the URL itself. It needs the daemon on "
+        "this machine's 127.0.0.1 (not from a Docker sandbox)."
     ),
     "parameters": {
         "type": "object",
@@ -979,6 +983,9 @@ PREVIEW_SHARE_SCHEMA = {
             "device": {"type": "string", "maxLength": 64,
                        "description": "adb serial of an Android device to share its screen, e.g. 'emulator-5554' or "
                                       "'host.docker.internal:5555'. Not with port."},
+            "voice": {"type": "string", "maxLength": 1024,
+                      "description": "Path, in your terminal, of the url-file the local voice daemon wrote (python -m "
+                                     "briefling_voice.daemon --url-file <path>). Not with port or device."},
             "label": {"type": "string", "maxLength": 80,
                       "description": "Optional short name shown on the line, e.g. 'Login page (Vite)'."},
         },
@@ -990,13 +997,14 @@ PREVIEW_STOP_SCHEMA = {
     "name": "preview_stop",
     "description": (
         "briefling only, in a thread: stop a preview you shared with preview_share on this port (or this device for "
-        "a screen). Its line in the thread turns off and the open previews close."
+        "a screen, or voice=true for the voice channel). Its line in the thread turns off and the open previews close."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "port": {"type": "integer", "minimum": 1024, "maximum": 65535, "description": "Port given to preview_share."},
             "device": {"type": "string", "maxLength": 64, "description": "Device given to preview_share (a screen)."},
+            "voice": {"type": "boolean", "description": "true to stop the voice channel."},
         },
     },
 }

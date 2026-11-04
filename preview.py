@@ -4,7 +4,10 @@ The plugin runs in the Hermes gateway process on the HOST, while the agent's ter
 Docker sandbox (terminal backend docker) whose 127.0.0.1 the host cannot reach. So everything that touches
 127.0.0.1:<port> runs INSIDE the agent's terminal environment, the one Hermes keeps for the calling session's
 ``task_id`` (``tools.terminal_tool_lifecycle.get_active_env`` / ``ensure_task_env``): the probe of ``preview_share``
-and the peer process (``preview_peer.py``, headless Chromium) of each viewer session.
+and the peer process (``preview_peer.py``, headless Chromium) of each viewer session. A screen share runs
+``screen_peer.py`` instead, a voice channel ``voice_peer.py`` (a relay to the local voice daemon of the agent's
+machine, voice/: the plugin only keeps the path of the daemon's url-file; the peer reads it in the sandbox, so the
+daemon's URL and token never reach the gateway, the hub, a command line or a log).
 
 Security gates enforced here and in preview_peer.py:
 - the peer only fetches relative paths of 127.0.0.1:<port> (previewPathOk, in the peer's page script);
@@ -32,7 +35,7 @@ SDP_MAX = 16_384                          # protocol/preview.ts PREVIEW_SDP_MAX
 CANDIDATE_MAX = 1024                      # protocol/preview.ts PREVIEW_CANDIDATE_MAX
 SESSION_RE = re.compile(r"[A-Za-z0-9_-]{22,64}")  # protocol/preview.ts PREVIEW_SESSION_RE (fullmatch)
 PREVIEW_ERRORS = ("not_shared", "not_connected", "preview_off", "gone", "no_browser", "port_closed", "busy",
-                  "peer_failed", "timeout", "no_device", "no_scrcpy")  # protocol/preview.ts PREVIEW_ERRORS
+                  "peer_failed", "timeout", "no_device", "no_scrcpy", "no_voice")  # protocol/preview.ts PREVIEW_ERRORS
 DEVICE_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}")  # protocol/preview.ts PREVIEW_DEVICE_RE (fullmatch)
 MAX_PEERS = 3
 PEER_MAX_S = 30 * 60
@@ -40,6 +43,11 @@ PROBE_TIMEOUT_S = 15                      # docker exec + python start, the prob
 LOG_LINE_MAX = 200
 PEER_SOURCE = (Path(__file__).with_name("preview_peer.py")).read_text(encoding="utf-8")
 SCREEN_PEER_SOURCE = (Path(__file__).with_name("screen_peer.py")).read_text(encoding="utf-8")
+VOICE_PEER_SOURCE = (Path(__file__).with_name("voice_peer.py")).read_text(encoding="utf-8")
+VOICE_FILE_MAX = 1024
+# Peers need Playwright: an optional venv of the agent's machine wins over the plain python3 of the sandbox PATH
+# (which may have none). Expanded by the sandbox's shell: $HOME is the sandbox user's.
+PEER_VENV_PYTHON = "$HOME/.venvs/briefling-peer/bin/python"
 PROBE_OK = "BRIEFLING_PROBE_OK"
 # Any HTTP answer (404, 500 included) means something listens; refused/timeout means nothing does.
 PROBE_PY = (
@@ -51,6 +59,43 @@ PROBE_PY = (
     "except Exception:\n"
     "    sys.exit(1)\n"
     "print('" + PROBE_OK + "')\n"
+)
+
+
+class _Voice:
+    """Share key of a voice channel (shares are keyed ``(thread, port | device | VOICE)``): not a str, so it is never
+    mistaken for a device."""
+
+    def __repr__(self):
+        return "VOICE"
+
+
+VOICE = _Voice()
+# The daemon's url-file (voice/briefling_voice/daemon.py --url-file): exactly ws://127.0.0.1:<port>/<token>, one
+# optional trailing newline. Same pattern in voice_peer.py and in PROBE_VOICE_PY.
+VOICE_URL_RE = re.compile(r"ws://127\.0\.0\.1:(\d{1,5})/[A-Za-z0-9_-]{16,64}")
+# TCP connect only: the daemon takes ONE WebSocket client, a probe that opened one would be seen as a ghost client.
+# The path comes on stdin; the URL is never printed.
+PROBE_VOICE_PY = (
+    "import json, re, socket, sys\n"
+    "def out(s):\n"
+    "    print('" + PROBE_OK + " ' + s)\n"
+    "    sys.exit(0)\n"
+    "try:\n"
+    "    path = json.loads(sys.stdin.readline())['path']\n"
+    "    with open(path, 'r', encoding='ascii') as f:\n"
+    "        raw = f.read(256)\n"
+    "except Exception:\n"
+    "    out('no file')\n"
+    "raw = raw[:-1] if raw.endswith('\\n') else raw\n"
+    "m = re.fullmatch(r'ws://127\\.0\\.0\\.1:(\\d{1,5})/[A-Za-z0-9_-]{16,64}', raw)\n"
+    "if not m or not 1 <= int(m.group(1)) <= 65535:\n"
+    "    out('bad url')\n"
+    "try:\n"
+    "    socket.create_connection(('127.0.0.1', int(m.group(1))), timeout=1).close()\n"
+    "except OSError:\n"
+    "    out('not listening')\n"
+    "out('ok')\n"
 )
 
 
@@ -72,8 +117,34 @@ def device_ok(x: Any) -> bool:
 
 
 def target_ok(x: Any) -> bool:
-    """What a share points at: a port (web page) or an adb serial (screen)."""
-    return port_ok(x) or device_ok(x)
+    """What a share points at: a port (web page), an adb serial (screen) or VOICE (voice channel)."""
+    return x is VOICE or port_ok(x) or device_ok(x)
+
+
+def voice_file_ok(x: Any) -> bool:
+    """A url-file path as the agent gives it: one bounded line, no control character. Not secret, and trusted for
+    nothing but a read in the agent's own sandbox."""
+    return (isinstance(x, str) and 0 < len(x) <= VOICE_FILE_MAX and not re.search(r"[\x00-\x1f\x7f]", x)
+            and not re.match(r"wss?://", x, re.I))  # the URL itself, pasted instead of its file
+
+
+def voice_url_ok(raw: Any) -> Optional[int]:
+    """The daemon port when ``raw`` (the url-file's content) is exactly ws://127.0.0.1:<port>/<token> (one trailing
+    newline allowed), else None."""
+    if not isinstance(raw, str):
+        return None
+    m = VOICE_URL_RE.fullmatch(raw[:-1] if raw.endswith("\n") else raw)
+    return int(m.group(1)) if m and 1 <= int(m.group(1)) <= 65535 else None
+
+
+def target_what(x: Any) -> str:
+    """A share's target, for the agent's messages and logs."""
+    return "voice channel" if x is VOICE else f"device {x}" if isinstance(x, str) else f"port {x}"
+
+
+def target_frame(x: Any) -> Dict[str, Any]:
+    """The target fields of ``preview.share`` (protocol/frames.ts: exactly one of port, device, voice)."""
+    return {"voice": True} if x is VOICE else {"device": x} if isinstance(x, str) else {"port": x}
 
 
 def clean_label(x: Any) -> str:
@@ -221,6 +292,21 @@ def probe_port(env, port: int) -> bool:
     return PROBE_OK in (out or "")
 
 
+def probe_voice(env, path: str) -> str:
+    """'ok' when the url-file at ``path`` (in the agent's environment) holds a daemon URL whose port accepts a TCP
+    connection, else 'no file' / 'bad url' / 'not listening' / 'no answer'. The path rides on stdin."""
+    proc = spawn_in_env(env, python_command(PROBE_VOICE_PY), stdin_data=json.dumps({"path": path}) + "\n",
+                        timeout=PROBE_TIMEOUT_S)
+    try:
+        out = proc.stdout.read() if hasattr(proc.stdout, "read") else "".join(proc.stdout)
+        proc.wait(timeout=PROBE_TIMEOUT_S)
+    except Exception:
+        _kill(env, proc)
+        return "no answer"
+    m = re.search(PROBE_OK + r" (ok|no file|bad url|not listening)\b", out or "")
+    return m.group(1) if m else "no answer"
+
+
 def probe_device(env, device: str) -> str:
     """`adb -s <device> get-state` in the agent's environment: 'device' when online, else what adb said (one line,
     bounded) or 'no adb'."""
@@ -235,8 +321,32 @@ def probe_device(env, device: str) -> str:
     return re.sub(r"[\x00-\x1f]+", " ", out or "").strip()[:LOG_LINE_MAX] or "no answer"
 
 
-def peer_command(tag: str, screen: bool = False) -> str:
-    return f"python3 -c {shlex.quote(SCREEN_PEER_SOURCE if screen else PEER_SOURCE)} {tag}"
+def python_command(src: str, *args: str) -> str:
+    """``<python> -c <src> <args>`` for the sandbox's bash, <python> = PEER_VENV_PYTHON when it is executable there,
+    else ``python3``. ``args`` are quoted; nothing secret ever goes there (secrets ride on stdin)."""
+    tail = "".join(" " + shlex.quote(a) for a in args)
+    return (f'P=python3; [ -x "{PEER_VENV_PYTHON}" ] && P="{PEER_VENV_PYTHON}"; '
+            f'"$P" -c {shlex.quote(src)}{tail}')
+
+
+PEER_SOURCES = {"web": PEER_SOURCE, "screen": SCREEN_PEER_SOURCE, "voice": VOICE_PEER_SOURCE}
+
+
+def peer_command(tag: str, kind: str = "web") -> str:
+    """The peer of a share kind: ``web`` | ``screen`` | ``voice`` (see ``peer_kind``)."""
+    return python_command(PEER_SOURCES[kind], tag)
+
+
+def peer_kind(target: Any) -> str:
+    return "voice" if target is VOICE else "screen" if isinstance(target, str) else "web"
+
+
+# A daemon URL in a peer's log line (a Playwright error may quote it): the token is cut before any log.
+_WS_TOKEN_RE = re.compile(r"(ws://[^/\s]+/)[A-Za-z0-9_-]+")
+
+
+def redact(line: str) -> str:
+    return _WS_TOKEN_RE.sub(r"\1***", line)
 
 
 def _kill(env, proc) -> None:
@@ -274,7 +384,7 @@ def kill_peer(env, proc, tag: str) -> None:
 class Peer:
     ctx: Any = None  # the share's turn context (in_turn_context)
 
-    def __init__(self, session: str, thread: str, port: Any, msg: str, tag: str):  # port: int, or the device (str) of a screen
+    def __init__(self, session: str, thread: str, port: Any, msg: str, tag: str):  # port: int, the device (str) of a screen, or VOICE
         self.session, self.thread, self.port, self.msg, self.tag = session, thread, port, msg, tag
         self.env: Any = None
         self.proc: Any = None
@@ -294,7 +404,7 @@ class Previews:
     def __init__(self, send: Callable[[Dict[str, Any]], Any]):
         self.send = send
         self.loop: Any = None
-        self.shares: Dict[Tuple[str, Any], Dict[str, Any]] = {}  # (thread, port or device)
+        self.shares: Dict[Tuple[str, Any], Dict[str, Any]] = {}  # (thread, port, device or VOICE)
         self.peers: Dict[str, Peer] = {}
         self.lock = threading.Lock()
         self.session_env = session_env    # seams for the tests
@@ -305,10 +415,14 @@ class Previews:
     def share_of(self, thread: str, port: Any) -> Optional[Dict[str, Any]]:
         return self.shares.get((thread, port))
 
-    def remember(self, thread: str, port: Any, task_id: Optional[str], msg: str, label: str, env: Any = None, ctx: Any = None) -> None:
+    def remember(self, thread: str, port: Any, task_id: Optional[str], msg: str, label: str, env: Any = None, ctx: Any = None,
+                 voice_file: Optional[str] = None) -> None:
         # env: the agent's terminal environment, resolved in its turn (see session_env); ctx: that turn's context
-        # (see in_turn_context), under which every later step on that environment runs.
+        # (see in_turn_context), under which every later step on that environment runs. voice_file: the daemon's
+        # url-file path of a voice channel (memory only, handed to its peers on stdin).
         self.shares[(thread, port)] = {"task_id": task_id, "msg": msg, "label": label, "env": env, "ctx": ctx}
+        if port is VOICE:
+            self.shares[(thread, port)]["voice_file"] = voice_file
 
     def forget(self, thread: str, port: Any) -> Optional[Dict[str, Any]]:
         share = self.shares.pop((thread, port), None)
@@ -322,9 +436,10 @@ class Previews:
         import asyncio
         self.loop = asyncio.get_running_loop()
         session, thread, msg = frame.get("session"), frame.get("thread"), frame.get("msg")
-        # A screen offer carries the device instead of the port (protocol/preview.ts); the share is keyed by either.
-        port = frame.get("device") if "device" in frame else frame.get("port")
-        screen = isinstance(port, str)
+        # A screen offer carries the device instead of the port, a voice offer `voice: true` (protocol/preview.ts); the
+        # share is keyed by its target.
+        port = VOICE if frame.get("voice") is True else frame.get("device") if "device" in frame else frame.get("port")
+        kind = peer_kind(port)
         if not (isinstance(session, str) and SESSION_RE.fullmatch(session)):
             return
         if session in self.peers:
@@ -344,13 +459,14 @@ class Previews:
                 self.peers[session] = peer
         if busy:
             return await self._failed(session, "busy")
-        # The TURN credentials (ice) travel on stdin only; the command line carries the source and a random tag.
-        stdin = json.dumps({("device" if screen else "port"): port, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)],
-                            "max_s": PEER_MAX_S}) + "\n"
+        # The TURN credentials (ice) and a voice url-file path travel on stdin only; the command line carries the
+        # source and a random tag.
+        what = {"voice_file": share.get("voice_file")} if kind == "voice" else {("device" if kind == "screen" else "port"): port}
+        stdin = json.dumps({**what, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)], "max_s": PEER_MAX_S}) + "\n"
         try:
             peer.ctx = ctx = share.get("ctx")
             peer.env = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.session_env(share.get("env"))))
-            peer.proc = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.spawn(peer.env, peer_command(peer.tag, screen), stdin)))
+            peer.proc = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.spawn(peer.env, peer_command(peer.tag, kind), stdin)))
         except PreviewError as e:
             logger.warning("[briefling] preview peer not started: %s", e)
             self.peers.pop(session, None)
@@ -364,7 +480,7 @@ class Previews:
             return
         peer.timer = self.loop.call_later(PEER_MAX_S, self.close, session)
         threading.Thread(target=self._read, args=(peer,), daemon=True, name=f"preview-{peer.tag}").start()
-        logger.info("[briefling] preview peer started for %s (%d live)", f"device {port}" if screen else f"port {port}", len(self.peers))
+        logger.info("[briefling] preview peer started for %s (%d live)", target_what(port), len(self.peers))
 
     def _read(self, peer: Peer) -> None:
         """Peer stdout, in its own thread: JSON lines become frames, anything else is a log line (never forwarded)."""
@@ -377,7 +493,7 @@ class Previews:
                     obj = None
                 if not isinstance(obj, dict) or not isinstance(obj.get("t"), str):
                     if line.strip():
-                        logger.debug("[briefling] preview peer: %s", line[:LOG_LINE_MAX])
+                        logger.debug("[briefling] preview peer: %s", redact(line)[:LOG_LINE_MAX])
                     continue
                 self._call(self._on_line(peer, obj))
         except Exception as e:  # stream closed by a kill

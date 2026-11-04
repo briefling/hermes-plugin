@@ -11,7 +11,9 @@ the hub, no inbound port.
 - `preview_share` / `preview_stop`: the agent shares a dev server of its terminal (127.0.0.1:<port>) with the thread's
   leads, who open it in briefling over WebRTC (no inbound port). Each viewer gets one headless Chromium peer started
   in the agent's terminal environment (needs `python3` with Playwright + Chromium there, e.g.
-  `pip install playwright && python3 -m playwright install chromium`).
+  `pip install playwright && python3 -m playwright install chromium`). The same tools share an Android screen
+  (`device`) or open a voice channel to a local voice daemon (`voice` = the path of its url-file; the URL and its
+  token never leave the agent's terminal).
 - Only messages from humans the space trusts reach the agent (checked by the hub, then again by the plugin through
   `BRIEFLING_ALLOWED_USERS`, or the hub's list with `BRIEFLING_ALLOWED_FROM=hub`, see below).
 
@@ -20,6 +22,10 @@ the hub, no inbound port.
 ```sh
 hermes plugins install briefling/hermes-plugin --enable
 ```
+
+Optional, for previews: when the terminal's `python3` has no Playwright, peers start with
+`~/.venvs/briefling-peer/bin/python` if it exists (e.g. `uv venv ~/.venvs/briefling-peer && uv pip install -p
+~/.venvs/briefling-peer playwright==1.64.0 && ~/.venvs/briefling-peer/bin/python -m playwright install chromium`).
 
 Then redeem the invitation link a briefling admin gave you (`<app>/agent.md?code=...`; the page itself explains the
 steps). It writes this agent's own credentials into the profile's `.env` and never prints them:

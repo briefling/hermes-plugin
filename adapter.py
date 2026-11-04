@@ -52,7 +52,9 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   shares 127.0.0.1:<port> of its terminal with the thread's leads (probe first, in that terminal); hub
   ``preview.offer`` starts one peer (preview_peer.py, headless Chromium) INSIDE the agent's terminal environment,
   whose stdout lines become ``preview.answer`` / ``preview.candidate`` / ``preview.failed``; ``preview.close`` kills it
-  (preview.py).
+  (preview.py). A screen share (``device``) runs screen_peer.py; a voice channel (``voice`` = the url-file path of
+  the local voice daemon) runs voice_peer.py, which relays the lead's microphone and the daemon's transcripts and
+  speech; the path stays in the plugin's memory and on the peer's stdin, never in a frame.
 - hub ``secret.deliver`` -> ``secret.received``: a secret a trusted human handed to the agent, end-to-end encrypted
   for the in-memory key reported at subscribe (``plugin.secret_key``); stored outside the conversation (vault.py),
   tool ``secret_totp`` for MFA codes.
@@ -197,7 +199,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.33"
+VERSION = "0.3.34"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1321,34 +1323,38 @@ class BrieflingAdapter(BasePlatformAdapter):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "detail": "Recorded: listed in the thread info (CI result shown in this thread when the space follows it). Nothing else to do."}
 
-    async def preview_share(self, thread: str, port: int, label: str, task_id: Optional[str], env: Any = None, ctx: Any = None) -> Dict[str, Any]:
+    async def preview_share(self, thread: str, port: Any, label: str, task_id: Optional[str], env: Any = None, ctx: Any = None,
+                            voice_file: Optional[str] = None) -> Dict[str, Any]:
         """Post the preview line (``preview.share``, answered ``preview.shared``) and remember the share with the
         terminal environment resolved in the agent's turn (``env``): the offers of that line start their peer there,
-        and only while that environment is still alive (``preview.session_env``)."""
-        what = f"device {port}" if isinstance(port, str) else f"port {port}"
+        and only while that environment is still alive (``preview.session_env``). ``port`` is the target: a port, a
+        device, or ``pv.VOICE`` with ``voice_file`` (kept here, never sent)."""
+        what = pv.target_what(port)
         old = self._previews.share_of(thread, port)
         if old:
             old["env"], old["ctx"] = env, ctx  # a share again (e.g. after its sandbox restarted) points at the live environment
+            if port is pv.VOICE:
+                old["voice_file"] = voice_file  # the daemon may have been restarted with another url-file
             return {"ok": True, "msg": old["msg"], "detail": f"Already shared ({what}) in this thread. " + PREVIEW_SHARED}
         agent = self._thread_agent.get(thread)
         if not agent:
             return {"ok": False, "error": "no_agent", "detail": "No message of this thread reached this agent yet: try in your next turn."}
         try:
-            target = {"device": port} if isinstance(port, str) else {"port": port}
+            target = pv.target_frame(port)
             res = await self._request({"type": "preview.share", "thread": thread, "agent": agent, **target, "label": label})
         except HubRefused as e:
             return {"ok": False, "error": e.code, "detail": PREVIEW_ERRORS_TEXT.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         msg = str(res.get("msg") or "")
-        self._previews.remember(thread, port, task_id, msg, label, env, ctx)
+        self._previews.remember(thread, port, task_id, msg, label, env, ctx, voice_file=voice_file)
         return {"ok": True, "msg": msg, "detail": PREVIEW_SHARED}
 
     async def preview_stop(self, thread: str, port: int) -> Dict[str, Any]:
         """Turn the line off (``preview.stop``), forget the share and kill its open peers."""
         share = self._previews.share_of(thread, port)
         if not share:
-            what = f"device {port}" if isinstance(port, str) else f"port {port}"
+            what = pv.target_what(port)
             return {"ok": False, "error": "not_shared", "detail": f"No preview shared ({what}) in this thread (or the gateway restarted since)."}
         try:
             await self._request({"type": "preview.stop", "thread": thread, "msg": share["msg"]})
@@ -1357,7 +1363,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         self._previews.forget(thread, port)
-        what = f"device {port}" if isinstance(port, str) else f"port {port}"
+        what = pv.target_what(port)
         return {"ok": True, "detail": f"Preview ({what}) stopped: its line is off, open previews closed."}
 
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], file_name: Optional[str] = None) -> SendResult:
@@ -1900,11 +1906,21 @@ def pushed_commits_tool(args: Dict[str, Any], **_: Any) -> str:
 
 def _preview_port(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Any, Optional[str]]:
     """(thread, target, None) or (None, None, error message): session and target checked before any frame. The target
-    is the port (int) of a web preview or the adb serial (str) of a screen share: exactly one of the two."""
+    is the port (int) of a web preview, the adb serial (str) of a screen share or ``pv.VOICE`` (voice channel):
+    exactly one of the three. preview_share's voice url-file path is checked by ``_voice_file``."""
     thread, err = _session_thread(tool)
     if err:
         return None, None, err
-    port, device = args.get("port"), args.get("device")
+    port, device, voice = args.get("port"), args.get("device"), args.get("voice")
+    if voice not in (None, "", False):
+        if port not in (None, "") or device not in (None, ""):
+            return None, None, "give one of port (a web page), device (an Android screen) or voice (a voice channel)."
+        if tool == "preview_stop" and voice is not True:
+            return None, None, "voice must be true to stop the voice channel."
+        if tool == "preview_share" and not pv.voice_file_ok(voice):
+            return None, None, (f"voice must be the path of the voice daemon's url-file in your terminal (one line, at most "
+                                f"{pv.VOICE_FILE_MAX} characters), never the URL itself.")
+        return thread, pv.VOICE, None
     if device not in (None, ""):
         if port not in (None, ""):
             return None, None, "give either port (a web page) or device (an Android screen), not both."
@@ -1925,6 +1941,19 @@ def preview_share_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_:
     thread, port, err = _preview_port("preview_share", args)
     if err:
         return tool_error(err)
+    if port is pv.VOICE:  # a voice channel: the daemon's url-file must hold its URL and its port must listen
+        path = args["voice"]
+        try:
+            env = pv.task_env(task_id)
+            state = pv.probe_voice(env, path)
+        except pv.PreviewError as e:
+            return tool_error(f"cannot reach your terminal environment to check the voice daemon: {e}")
+        if state != "ok":
+            return tool_error(f"no voice daemon behind {path} ({state}): start it in the background (python -m "
+                              f"briefling_voice.daemon --url-file {path} --tts-python ...) then call preview_share again.")
+        label = pv.clean_label(args.get("label"))
+        ctx = contextvars.copy_context()
+        return _on_adapter("preview_share", thread, lambda a: a.preview_share(thread, port, label, task_id, env, ctx, voice_file=path))
     if isinstance(port, str):  # a screen: the device must be online for adb in the agent's terminal
         try:
             env = pv.task_env(task_id)
