@@ -157,6 +157,11 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     ASK_ERRORS,
     build_ask_choices,
     ISSUE_SCHEMA,
+    ELEVATION_SCHEMA,
+    ELEVATION_ERRORS,
+    ELEVATION_MINUTES_MIN,
+    ELEVATION_MINUTES_MAX,
+    ELEVATION_REASON_MAX,
     ABOUT_SCHEMA,
     OUTCOME_SCHEMA,
     clean_summary,
@@ -191,7 +196,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.30"
+VERSION = "0.3.31"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1079,6 +1084,17 @@ class BrieflingAdapter(BasePlatformAdapter):
         return {"ok": True, "card": ack.get("msg_id"),
                 "detail": CARD_SHOWN["propose_issue"]}
 
+    async def request_elevation(self, thread: str, account: str, minutes: int, reason: str) -> Dict[str, Any]:
+        """Show an AWS elevation card. Nothing is granted until a trusted human approves it with a passkey."""
+        frame: Dict[str, Any] = {"type": "elevation.request", "thread": thread, "account": account, "minutes": minutes, "reason": reason}
+        try:
+            ack = await self._request(frame)
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": ELEVATION_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
+        return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["request_elevation"]}
+
     async def ask_choices(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
         """Show a « To decide » card (frame from build_ask_choices). The turn goes on: the answer is a later message."""
         try:
@@ -1704,6 +1720,24 @@ def propose_issue_tool(args: Dict[str, Any], **_: Any) -> str:
     if len(body) > NEW_ISSUE_BODY_MAX:
         return tool_error(f"body too long ({len(body)} chars, max {NEW_ISSUE_BODY_MAX}).")
     return _on_adapter("propose_issue", thread, lambda a: a.propose_issue(thread, repo, title, body))
+
+
+def request_elevation_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: elevation.request (a card; the hub checks the turn, the elevation Lambda the agent and account)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("request_elevation")
+    if err:
+        return tool_error(err)
+    account = str(args.get("account") or "").strip()
+    minutes = args.get("minutes")
+    reason = " ".join(str(args.get("reason") or "").split())
+    if not re.fullmatch(r"\d{12}", account):
+        return tool_error("account is required: the AWS account id, 12 digits.")
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or not ELEVATION_MINUTES_MIN <= minutes <= ELEVATION_MINUTES_MAX:
+        return tool_error(f"minutes is required: an integer from {ELEVATION_MINUTES_MIN} to {ELEVATION_MINUTES_MAX}.")
+    if not reason or len(reason) > ELEVATION_REASON_MAX:
+        return tool_error(f"reason is required, one line, max {ELEVATION_REASON_MAX} chars.")
+    return _on_adapter("request_elevation", thread, lambda a: a.request_elevation(thread, account, minutes, reason))
 
 
 def ask_choices_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2341,6 +2375,8 @@ def register(ctx) -> None:
                           description=PROPOSE_SCHEMA["description"], emoji="🧵")
         ctx.register_tool(name="propose_issue", toolset="briefling", schema=ISSUE_SCHEMA, handler=propose_issue_tool,
                           description=ISSUE_SCHEMA["description"], emoji="🐙")
+        ctx.register_tool(name="request_elevation", toolset="briefling", schema=ELEVATION_SCHEMA, handler=request_elevation_tool,
+                          description=ELEVATION_SCHEMA["description"], emoji="🔐")
         ctx.register_tool(name="ask_choices", toolset="briefling", schema=ASK_CHOICES_SCHEMA, handler=ask_choices_tool,
                           description=ASK_CHOICES_SCHEMA["description"], emoji="🔀")
         ctx.register_tool(name="propose_plan", toolset="briefling", schema=PLAN_SCHEMA, handler=propose_plan_tool,

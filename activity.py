@@ -36,7 +36,7 @@ _SCRIPT_TOOLS = frozenset({"execute_code"})
 # Talking to the humans of the thread (briefling tools): the call is part of the answer.
 _ANSWER_TOOLS = frozenset({
     "turn_outcome", "propose_thread", "propose_issue", "propose_plan", "propose_space_about", "topic_title",
-    "ask_choices", "clarify", "send_message", "text_to_speech",
+    "ask_choices", "request_elevation", "clarify", "send_message", "text_to_speech",
 })
 
 # Shell commands, matched on the whole command line (`cd x && npm test` is a test run). Deploy before test before git.

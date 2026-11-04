@@ -41,6 +41,8 @@ _AFTER_TEXT = "shown in this conversation right after your text of this turn (be
 CARD_SHOWN = {
     "propose_thread": f"Card {_AFTER_TEXT}; a human decides whether to open the thread.",
     "propose_issue": f"Card {_AFTER_TEXT}; nothing is on GitHub until a trusted human clicks Create the issue.",
+    "request_elevation": (f"Card {_AFTER_TEXT}; nothing is granted until a trusted human approves it with a passkey. "
+                          "End your turn now (in a thread: turn_outcome waiting, action 'approve the elevation')."),
     "propose_space_about": f"Draft {_AFTER_TEXT}; the admin reviews it, applies it to the space settings and saves.",
     "ask_choices": (f"Card {_AFTER_TEXT}. End your turn now (in a thread: turn_outcome waiting, action 'answer the "
                     "card'); do not repeat the questions in text. The human's choices come back as your next message, "
@@ -664,6 +666,44 @@ ISSUE_SCHEMA = {
         },
         "required": ["repo", "title", "body"],
     },
+}
+
+
+ELEVATION_MINUTES_MIN, ELEVATION_MINUTES_MAX, ELEVATION_REASON_MAX = 5, 60, 300  # protocol/frames.ts
+
+ELEVATION_SCHEMA = {
+    "name": "request_elevation",
+    "description": (
+        "briefling only, in a Lounge topic or a thread: ask for temporary admin (permission set AgentElevated) on one "
+        "AWS account, for a few minutes, when the task needs a write your usual role does not allow on that account. "
+        "It shows a card; nothing is granted until a trusted human approves it with a passkey (Face ID) in the app, "
+        "and the grant is checked and done outside briefling. Write your reply first (what you will do with it), then "
+        "call this and end your turn (in a thread: turn_outcome waiting, action 'approve the elevation'): the approval "
+        "comes back as a message naming the account and the expiry. Then use the AgentElevated role of that account "
+        "through your SSO profile (it may take a minute to show up), and only for the stated reason. Ask for the "
+        "shortest duration that fits. Accounts with a permanent role of yours (e.g. a sandbox) need no elevation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "account": {"type": "string", "description": "AWS account id, 12 digits."},
+            "minutes": {"type": "integer", "description": f"Duration, {ELEVATION_MINUTES_MIN} to {ELEVATION_MINUTES_MAX} minutes."},
+            "reason": {"type": "string", "description": f"What you will do with it, one line (max {ELEVATION_REASON_MAX} chars), in the team's language."},
+        },
+        "required": ["account", "minutes", "reason"],
+    },
+}
+
+ELEVATION_ERRORS = {
+    "not_in_charge": "You are a guest in this thread (called by a mention): only its agent in charge does that here.",
+    "no_turn": "Only during a turn triggered by a trusted human in this conversation.",
+    "elevation_off": "Temporary elevation is not set up on this briefling.",
+    "agent_not_allowed": "You are not on the list of agents that may be elevated.",
+    "account_not_allowed": "That account is not eligible for elevation (ask the human which accounts are).",
+    "elevation_failed": "The elevation service did not answer, try again later.",
+    "forbidden": "Not allowed for this instance.",
+    "bad_frame": (f"Invalid account, minutes or reason (12 digits, {ELEVATION_MINUTES_MIN}-{ELEVATION_MINUTES_MAX} "
+                  f"minutes, reason 1-{ELEVATION_REASON_MAX} chars on one line)."),
 }
 
 
