@@ -41,8 +41,9 @@ _AFTER_TEXT = "shown in this conversation right after your text of this turn (be
 CARD_SHOWN = {
     "propose_thread": f"Card {_AFTER_TEXT}; a human decides whether to open the thread.",
     "propose_issue": f"Card {_AFTER_TEXT}; nothing is on GitHub until a trusted human clicks Create the issue.",
-    "request_elevation": (f"Card {_AFTER_TEXT}; nothing is granted until a trusted human approves it with a passkey. "
-                          "End your turn now (in a thread: turn_outcome waiting, action 'approve the elevation')."),
+    "request_elevation": (f"Card {_AFTER_TEXT}; nothing is granted until the owner approves it with a passkey outside "
+                          "briefling. End your turn now (in a thread: turn_outcome waiting, action 'approve the "
+                          "elevation, then Check')."),
     "propose_space_about": f"Draft {_AFTER_TEXT}; the admin reviews it, applies it to the space settings and saves.",
     "ask_choices": (f"Card {_AFTER_TEXT}. End your turn now (in a thread: turn_outcome waiting, action 'answer the "
                     "card'); do not repeat the questions in text. The human's choices come back as your next message, "
@@ -676,9 +677,9 @@ ELEVATION_SCHEMA = {
     "description": (
         "briefling only, in a Lounge topic or a thread: ask for temporary admin (permission set AgentElevated) on one "
         "AWS account, for a few minutes, when the task needs a write your usual role does not allow on that account. "
-        "It shows a card; nothing is granted until a trusted human approves it with a passkey (Face ID) in the app, "
-        "and the grant is checked and done outside briefling. Write your reply first (what you will do with it), then "
-        "call this and end your turn (in a thread: turn_outcome waiting, action 'approve the elevation'): the approval "
+        "It shows a card; nothing is granted until the owner approves it with a passkey (Face ID) on an approval page "
+        "outside briefling, then checks the card. Write your reply first (what you will do with it), then call this "
+        "and end your turn (in a thread: turn_outcome waiting, action 'approve the elevation, then Check'): the grant "
         "comes back as a message naming the account and the expiry. Then use the AgentElevated role of that account "
         "through your SSO profile (it may take a minute to show up), and only for the stated reason. Ask for the "
         "shortest duration that fits. Accounts with a permanent role of yours (e.g. a sandbox) need no elevation."
