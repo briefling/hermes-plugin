@@ -17,6 +17,7 @@ _PRIORITY = ("deploy", "test", "code", "git", "read", "coordination", "answer", 
 _READ_TOOLS = frozenset({
     "read_file", "search_files", "web_search", "web_extract", "vision_analyze", "skill_view", "skills_list",
     "session_search", "chat_history_lookup", "memory_search", "memory_read", "tool_search", "tool_describe",
+    "space_threads", "thread_read", "space_metrics",
 })
 _CODE_TOOLS = frozenset({"patch", "write_file"})
 _SHELL_TOOLS = frozenset({"terminal"})

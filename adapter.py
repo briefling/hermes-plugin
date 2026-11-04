@@ -31,6 +31,8 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   end of the turn. Queued: the hub parks the thread; the agent ends its turn without ``turn_outcome`` and the hub
   resumes the thread with a new message once the resource is granted to it.
 - tool ``release_resource`` -> ``resource.release`` (``ack``): done with the resource, the next parked thread gets it.
+- tools ``space_threads`` / ``thread_read`` / ``space_metrics`` -> ``space.threads`` / ``thread.read`` / ``space.metrics``
+  (``introspect.result``): read only, conversations of a space the agent serves (same gates as memory_search, hub side).
 - tools ``memory_search`` / ``memory_read`` -> ``memory.search`` / ``memory.read`` (``memory.result``): published
   entries of the space's project memory, handed to the agent as cited data (provenance), never as instructions.
   Another space only if this agent serves it and the human of the turn is a member (the hub checks).
@@ -164,6 +166,14 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     PUSHED_SCHEMA,
     MEMORY_SPACE_PARAM,
     MEMORY_SEARCH_SCHEMA,
+    SPACE_THREADS_SCHEMA,
+    THREAD_READ_SCHEMA,
+    SPACE_METRICS_SCHEMA,
+    INTROSPECT_ERRORS,
+    build_space_threads,
+    build_thread_read,
+    build_space_metrics,
+    introspect_result,
     MEMORY_READ_SCHEMA,
     MEMORY_PROPOSE_SCHEMA,
     MEMORY_TAG_BATCH,
@@ -181,7 +191,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.29"
+VERSION = "0.3.30"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -816,7 +826,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
             for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
-        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result",
+        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1173,6 +1183,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return memory_result(res)
+
+    async def introspect(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """space.threads / thread.read / space.metrics: read only, the hub checks turn, membership and space."""
+        try:
+            res = await self._request({**frame, "thread": thread}, timeout=25)
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": INTROSPECT_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return introspect_result(res)
 
     async def memory_propose(self, thread: str, text: str, kind: str, sources: List[str], tags: List[str],
                              replaces: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -2096,6 +2116,25 @@ def memory_read_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("memory_read", thread, lambda a: a.memory_lookup(thread, frame))
 
 
+def _introspect_tool(tool: str, build):
+    """Tool handler of an introspection tool: arguments -> frame (shared builder), waits for introspect.result."""
+    def handler(args: Dict[str, Any], **_: Any) -> str:
+        from tools.registry import tool_error
+        thread, err = _session_thread(tool)
+        if err:
+            return tool_error(err)
+        frame, err = build(args)
+        if err:
+            return tool_error(err)
+        return _on_adapter(tool, thread, lambda a: a.introspect(thread, frame))
+    return handler
+
+
+space_threads_tool = _introspect_tool("space_threads", build_space_threads)
+thread_read_tool = _introspect_tool("thread_read", build_thread_read)
+space_metrics_tool = _introspect_tool("space_metrics", build_space_metrics)
+
+
 def memory_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: memory.propose, waits for memory.proposed (published or waiting for a human)."""
     from tools.registry import tool_error
@@ -2326,6 +2365,10 @@ def register(ctx) -> None:
                           description=MEMORY_SEARCH_SCHEMA["description"], emoji="🧠")
         ctx.register_tool(name="memory_read", toolset="briefling", schema=MEMORY_READ_SCHEMA, handler=memory_read_tool,
                           description=MEMORY_READ_SCHEMA["description"], emoji="🧠")
+        for schema, handler in ((SPACE_THREADS_SCHEMA, space_threads_tool), (THREAD_READ_SCHEMA, thread_read_tool),
+                                (SPACE_METRICS_SCHEMA, space_metrics_tool)):
+            ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
+                              description=schema["description"], emoji="🔎")
         ctx.register_tool(name="memory_propose", toolset="briefling", schema=MEMORY_PROPOSE_SCHEMA, handler=memory_propose_tool,
                           description=MEMORY_PROPOSE_SCHEMA["description"], emoji="🧠")
         ctx.register_tool(name="memory_review", toolset="briefling", schema=MEMORY_REVIEW_SCHEMA, handler=memory_review_tool,
