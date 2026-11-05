@@ -570,7 +570,9 @@ def with_context(context: Dict[str, Any], text: str) -> str:
                  f"branch of each pushed head; briefling lists them in the thread info{prs}.]\n")
     if context.get("parallel") is True:
         head += ("[You may be working on other threads of this space at the same time: work in a git worktree "
-                 "dedicated to this thread, never in a copy another thread uses.]\n")
+                 "dedicated to this thread, never in a copy another thread uses. Once the work is over, before you "
+                 "end this thread with turn_outcome done: if its branch is in origin/main and the worktree has nothing "
+                 "uncommitted, remove that worktree and its local branch in the same turn (leave it first).]\n")
     head += spaces_context(context.get("spaces"))
     in_charge = context.get("in_charge")
     if isinstance(in_charge, str) and AGENT_NAME_RE.fullmatch(in_charge):
@@ -988,6 +990,23 @@ PREVIEW_SHARE_SCHEMA = {
                                      "briefling_voice.daemon --url-file <path>). Not with port or device."},
             "label": {"type": "string", "maxLength": 80,
                       "description": "Optional short name shown on the line, e.g. 'Login page (Vite)'."},
+        },
+    },
+}
+
+
+VOICE_OPEN_SCHEMA = {
+    "name": "voice_open",
+    "description": (
+        "briefling only, in a thread: open the voice channel with the lead (they talk, you get transcripts as their "
+        "messages and your replies are spoken). Call it when the lead taps « Voice » (a message tells you so), or "
+        "when they ask you to talk. It starts this host's voice daemon if it is not running (up to 90 s the first "
+        "time), then posts the voice line; their app opens it by itself. Stop it with preview_stop(voice=true)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "maxLength": 80, "description": "Optional short name shown on the line (default: your name)."},
         },
     },
 }

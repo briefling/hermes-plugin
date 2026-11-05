@@ -14,6 +14,11 @@ the hub, no inbound port.
   `pip install playwright && python3 -m playwright install chromium`). The same tools share an Android screen
   (`device`) or open a voice channel to a local voice daemon (`voice` = the path of its url-file; the URL and its
   token never leave the agent's terminal).
+- `voice_open`: talk without a voice line first. Set `BRIEFLING_VOICE` in the agent's `.env` to a directory of its
+  terminal holding `start`, an executable that runs the voice daemon in the foreground with `--url-file <dir>/url`.
+  The plugin then tells the hub that this agent can talk: the « Voice » button shows in every thread of the agent, and
+  a lead's tap reaches the agent as a message asking it to call `voice_open`, which starts the daemon if its url-file
+  does not answer (output in `<dir>/daemon.log`, up to 90 s for a cold start) and shares the voice line.
 - Only messages from humans the space trusts reach the agent (checked by the hub, then again by the plugin through
   `BRIEFLING_ALLOWED_USERS`, or the hub's list with `BRIEFLING_ALLOWED_FROM=hub`, see below).
 

@@ -109,7 +109,7 @@ from . import vault
 from . import background
 from . import preview as pv
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
-    PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
+    PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
     MAX_ACTION,
     NO_TEXT,
@@ -199,7 +199,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.34"
+VERSION = "0.3.35"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -514,6 +514,12 @@ def is_recording(f: Any) -> bool:
             and bool(RECORDING_RE.fullmatch(str(f.get("name") or ""))))
 
 
+# A lead tapped « Voice » with no voice line on (hub message with `voiceAsk`, protocol/preview.ts « Voice on request »).
+VOICE_ASK_HINT = ("[The human tapped « Voice » in briefling: they want to talk to you out loud in this thread. Call "
+                  "voice_open now (it starts your voice daemon if needed and shares the voice channel; their app opens "
+                  "it by itself), then reply in one short sentence. If voice_open fails, say why in one short sentence.]\n")
+
+
 def voice_hint(files: Any) -> str:
     """Hidden nudge: a voice note gets a text answer plus, when the agent can, a short audio summary."""
     return VOICE_HINT if any(is_recording(f) for f in (files if isinstance(files, list) else [])) else ""
@@ -639,6 +645,12 @@ class BrieflingAdapter(BasePlatformAdapter):
         # Agent web preview (preview.py): shares of this gateway (memory only) and their live peers.
         self._thread_agent: Dict[str, str] = {}  # thread -> agent the hub delivered it to (preview.share names it)
         self._previews = pv.Previews(self._send_frame)
+        # BRIEFLING_VOICE: directory of the agent's terminal holding the voice daemon's `start` and `url` (voice_open);
+        # announced to the hub at each subscribe so the « Voice » button shows without a voice line.
+        voice_dir = _setting(extra, "voice", "BRIEFLING_VOICE")
+        self._voice_dir = voice_dir if voice_dir and pv.voice_file_ok(voice_dir) else ""
+        if voice_dir and not self._voice_dir:
+            logger.warning("[briefling] BRIEFLING_VOICE ignored: not a plain path")
 
     # -- connection ----------------------------------------------------------
 
@@ -648,6 +660,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         frame: Dict[str, Any] = {"type": "subscribe", "plugin": {"version": VERSION}}
         if self._secret_key is not None:
             frame["plugin"]["secret_key"] = vault.public_key(self._secret_key)
+        if self._voice_dir:
+            frame["plugin"]["voice"] = True
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
@@ -884,7 +898,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         msg_type = inbound_type(msg.get("files"), kept, str(author.get("id") or ""))
         if not MessageEvent(text=text).get_command():
             text = with_context(frame.get("context") or {},
-                                vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + text)
+                                vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True else "") + text)
         source = self.build_source(
             chat_id=thread, chat_name=self._titles[thread], chat_type="dm",
             user_id=str(author.get("id") or ""), user_name=str(frame.get("author_name") or author.get("id") or ""), message_id=msg_id)
@@ -1979,6 +1993,44 @@ def preview_share_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_:
     return _on_adapter("preview_share", thread, lambda a: a.preview_share(thread, port, label, task_id, env, ctx))
 
 
+_VOICE_START_LOCK = threading.Lock()  # two « Voice » taps at once start one daemon
+
+
+def voice_open_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_: Any) -> str:
+    """Tool handler: the voice daemon of BRIEFLING_VOICE answers (started in the agent's terminal if its url-file does
+    not), then the voice line is shared as preview_share(voice=<url-file>) does. Runs in the agent's turn: the
+    environment and the context it resolves are the ones the offers use later."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("voice_open")
+    if err:
+        return tool_error(err)
+    adapter = next((a for a in list(_ADAPTERS) if thread in a._thread_space), None)
+    voice_dir = adapter._voice_dir if adapter is not None else ""
+    if not voice_dir:
+        return tool_error("no voice daemon is set up for you on this host (BRIEFLING_VOICE): the human can still send voice notes.")
+    path = pv.voice_url_file(voice_dir)
+    try:
+        env = pv.task_env(task_id)
+        with _VOICE_START_LOCK:
+            state = pv.probe_voice(env, path)
+            if state != "ok":
+                started = pv.start_voice(env, voice_dir)
+                if started != "started":
+                    return tool_error(f"cannot start the voice daemon ({started}): {voice_dir}/start must be an executable.")
+                deadline = time.monotonic() + pv.VOICE_START_S
+                while state != "ok" and time.monotonic() < deadline:
+                    time.sleep(pv.VOICE_POLL_S)
+                    state = pv.probe_voice(env, path)
+                if state != "ok":
+                    return tool_error(f"the voice daemon did not answer within {pv.VOICE_START_S} s ({state}): see "
+                                      f"{voice_dir}/daemon.log in your terminal.")
+    except pv.PreviewError as e:
+        return tool_error(f"cannot reach your terminal environment to start the voice daemon: {e}")
+    label = pv.clean_label(args.get("label")) or (adapter._thread_agent.get(thread) or "").capitalize()
+    ctx = contextvars.copy_context()
+    return _on_adapter("voice_open", thread, lambda a: a.preview_share(thread, pv.VOICE, label, task_id, env, ctx, voice_file=path))
+
+
 def preview_stop_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: preview.stop of this thread's share on that port."""
     from tools.registry import tool_error
@@ -2460,6 +2512,8 @@ def register(ctx) -> None:
                           description=PREVIEW_SHARE_SCHEMA["description"], emoji="🖥️")
         ctx.register_tool(name="preview_stop", toolset="briefling", schema=PREVIEW_STOP_SCHEMA, handler=preview_stop_tool,
                           description=PREVIEW_STOP_SCHEMA["description"], emoji="🖥️")
+        ctx.register_tool(name="voice_open", toolset="briefling", schema=VOICE_OPEN_SCHEMA, handler=voice_open_tool,
+                          description=VOICE_OPEN_SCHEMA["description"], emoji="🎙️")
         ctx.register_tool(name="memory_search", toolset="briefling", schema=MEMORY_SEARCH_SCHEMA, handler=memory_search_tool,
                           description=MEMORY_SEARCH_SCHEMA["description"], emoji="🧠")
         ctx.register_tool(name="memory_read", toolset="briefling", schema=MEMORY_READ_SCHEMA, handler=memory_read_tool,

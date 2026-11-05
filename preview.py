@@ -196,6 +196,50 @@ class HostEnv:
                 pass
 
 
+# Voice on request (protocol/preview.ts « Voice on request »): BRIEFLING_VOICE names a directory of the agent's terminal
+# holding `start` (an executable that runs the daemon with `--url-file <dir>/url`, in the foreground). The plugin starts
+# it detached (own session: it outlives the command and the agent's turn), its output in `<dir>/daemon.log`; the
+# directory rides on stdin, never in the command line.
+VOICE_START_S = 90  # a cold start loads the STT and TTS models
+VOICE_POLL_S = 1.0
+START_VOICE_PY = (
+    "import json, os, subprocess, sys\n"
+    "def out(s):\n"
+    "    print('" + PROBE_OK + " ' + s)\n"
+    "    sys.exit(0)\n"
+    "try:\n"
+    "    d = json.loads(sys.stdin.readline())['dir']\n"
+    "except Exception:\n"
+    "    out('no dir')\n"
+    "start = os.path.join(d, 'start')\n"
+    "if not (os.path.isfile(start) and os.access(start, os.X_OK)):\n"
+    "    out('no start')\n"
+    "log = open(os.path.join(d, 'daemon.log'), 'ab')\n"
+    "subprocess.Popen([start], cwd=d, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\n"
+    "out('started')\n"
+)
+
+
+def voice_url_file(voice_dir: str) -> str:
+    """The url-file the daemon of a BRIEFLING_VOICE directory writes."""
+    return voice_dir.rstrip("/") + "/url"
+
+
+def start_voice(env, voice_dir: str) -> str:
+    """Start the voice daemon of ``voice_dir`` in the agent's environment: 'started', 'no start' (no executable
+    ``start`` there), 'no dir' or 'no answer'. Does not wait for it to listen (``probe_voice`` does)."""
+    proc = spawn_in_env(env, python_command(START_VOICE_PY), stdin_data=json.dumps({"dir": voice_dir}) + "\n",
+                        timeout=PROBE_TIMEOUT_S)
+    try:
+        out = proc.stdout.read() if hasattr(proc.stdout, "read") else "".join(proc.stdout)
+        proc.wait(timeout=PROBE_TIMEOUT_S)
+    except Exception:
+        _kill(env, proc)
+        return "no answer"
+    m = re.search(PROBE_OK + r" (started|no start|no dir)\b", out or "")
+    return m.group(1) if m else "no answer"
+
+
 def _backend_is_local() -> bool:
     try:
         from tools.terminal_tool import _get_env_config  # private Hermes API: fail closed (not local) when missing
