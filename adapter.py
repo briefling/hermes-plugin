@@ -128,6 +128,10 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     PLAN_ERRORS,
     PLAN_SCHEMA,
     build_plan,
+    RADAR_ERRORS,
+    RADAR_SIGNAL_SCHEMA,
+    RADAR_RECORDED,
+    build_radar_signal,
     OUTCOME_ERRORS,
     RESOURCE_ERRORS,
     ABOUT_ERRORS,
@@ -199,7 +203,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.37"
+VERSION = "0.3.38"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1112,6 +1116,16 @@ class BrieflingAdapter(BasePlatformAdapter):
             return {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
         return {"ok": True, "card": ack.get("msg_id"),
                 "detail": CARD_SHOWN["propose_issue"]}
+
+    async def radar_signal(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """radar.signal: one finding of a Radar pass, stored as a signal (the same key updates it)."""
+        try:
+            ack = await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": RADAR_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "signal": ack.get("msg_id"), "detail": RADAR_RECORDED}
 
     async def request_elevation(self, thread: str, account: str, minutes: int, reason: str) -> Dict[str, Any]:
         """Show an AWS elevation card. Nothing is granted until a trusted human approves it with a passkey."""
@@ -2290,6 +2304,18 @@ thread_read_tool = _introspect_tool("thread_read", build_thread_read)
 space_metrics_tool = _introspect_tool("space_metrics", build_space_metrics)
 
 
+def radar_signal_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: radar.signal (Radar pass only; the hub checks the pass, the turn and the budget)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("radar_signal")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_radar_signal(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("radar_signal", thread, lambda a: a.radar_signal(thread, frame))
+
+
 def memory_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: memory.propose, waits for memory.proposed (published or waiting for a human)."""
     from tools.registry import tool_error
@@ -2528,6 +2554,8 @@ def register(ctx) -> None:
                                 (SPACE_METRICS_SCHEMA, space_metrics_tool)):
             ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
                               description=schema["description"], emoji="🔎")
+        ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
+                          description=RADAR_SIGNAL_SCHEMA["description"], emoji="📡")
         ctx.register_tool(name="memory_propose", toolset="briefling", schema=MEMORY_PROPOSE_SCHEMA, handler=memory_propose_tool,
                           description=MEMORY_PROPOSE_SCHEMA["description"], emoji="🧠")
         ctx.register_tool(name="memory_review", toolset="briefling", schema=MEMORY_REVIEW_SCHEMA, handler=memory_review_tool,
