@@ -514,6 +514,10 @@ class Previews:
         except PreviewError as e:
             logger.warning("[briefling] preview peer not started: %s", e)
             self.peers.pop(session, None)
+            if e.code == "gone":
+                # The hub turns the line off on `gone`: forget the share too, so that the next share (voice_open after
+                # the app asks again) posts a new line instead of answering « already shared » with the dead one.
+                self.shares.pop((thread, port), None)
             return await self._failed(session, e.code if e.code in PREVIEW_ERRORS else "peer_failed")
         except Exception as e:
             logger.warning("[briefling] preview peer not started: %s", type(e).__name__)
