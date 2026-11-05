@@ -199,7 +199,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.36"
+VERSION = "0.3.37"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -518,6 +518,11 @@ def is_recording(f: Any) -> bool:
 VOICE_ASK_HINT = ("[The human tapped « Voice » in briefling: they want to talk to you out loud in this thread. Call "
                   "voice_open now (it starts your voice daemon if needed and shares the voice channel; their app opens "
                   "it by itself), then reply in one short sentence. If voice_open fails, say why in one short sentence.]\n")
+# While a voice channel is shared in the thread, each spoken sentence arrives as a message and interrupts the turn.
+VOICE_TALK_HINT = ("[Voice channel open: the human talks to you out loud and each of their sentences interrupts your "
+                   "turn. Answer in 2 or 3 short sentences. Hand any longer work (code, tests, deploys, research) to "
+                   "background sub-agents with delegate_task if you have it, then tell them so in one sentence; report "
+                   "their result briefly when it comes back.]\n")
 
 
 def voice_hint(files: Any) -> str:
@@ -898,7 +903,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         msg_type = inbound_type(msg.get("files"), kept, str(author.get("id") or ""))
         if not MessageEvent(text=text).get_command():
             text = with_context(frame.get("context") or {},
-                                vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True else "") + text)
+                                vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True
+                                 else VOICE_TALK_HINT if self._previews.share_of(thread, pv.VOICE) else "") + text)
         source = self.build_source(
             chat_id=thread, chat_name=self._titles[thread], chat_type="dm",
             user_id=str(author.get("id") or ""), user_name=str(frame.get("author_name") or author.get("id") or ""), message_id=msg_id)

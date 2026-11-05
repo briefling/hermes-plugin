@@ -19,6 +19,9 @@ the hub, no inbound port.
   The plugin then tells the hub that this agent can talk: the « Voice » button shows in every thread of the agent, and
   a lead's tap reaches the agent as a message asking it to call `voice_open`, which starts the daemon if its url-file
   does not answer (output in `<dir>/daemon.log`, up to 90 s for a cold start) and shares the voice line.
+  While the voice channel is open in a thread, each message there tells the agent to answer in 2 or 3 short
+  sentences and to hand longer work to background sub-agents (`delegate_task`), since every spoken sentence
+  interrupts its turn.
 - Only messages from humans the space trusts reach the agent (checked by the hub, then again by the plugin through
   `BRIEFLING_ALLOWED_USERS`, or the hub's list with `BRIEFLING_ALLOWED_FROM=hub`, see below).
 
