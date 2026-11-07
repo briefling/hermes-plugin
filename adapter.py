@@ -108,6 +108,7 @@ from .flowswitch import SwitchError, parse_link
 from . import vault
 from . import background
 from . import preview as pv
+from . import projects as proj
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
@@ -208,7 +209,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.45"
+VERSION = "0.3.46"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -477,6 +478,31 @@ def on_pre_tool_call(**_: Any) -> None:
         logger.debug("briefling: pre_tool_call tracking failed", exc_info=True)
 
 
+# -- project mounted in the session's sandbox (projects.py) --------------------------------------------------------
+# ``pre_llm_call`` runs at every turn before the model's first call, so before any tool can create the sandbox. The
+# project comes from the thread's space as the hub sent it, never from a tool or a message.
+_unmounted_warned: set = set()
+
+
+def on_pre_llm_call(task_id: str = "", session_id: str = "", **_: Any) -> None:
+    try:
+        thread = _usage_thread()
+        adapter = next((a for a in list(_ADAPTERS) if thread and thread in a._thread_space), None)
+        if adapter is None or not adapter._projects:
+            return None
+        space = adapter._thread_space.get(thread, "")
+        folder = proj.project_dir(adapter._projects_root, adapter._projects, space)
+        key = task_id or session_id
+        if folder and key:
+            proj.bind_session_project(key, folder)
+        elif (space, thread) not in _unmounted_warned:
+            _unmounted_warned.add((space, thread))
+            logger.warning("[briefling] no project mounted for space %r (unmapped or refused folder)", space)
+    except Exception:  # Hermes then mounts nothing: closed
+        logger.warning("[briefling] project mount failed, nothing mounted", exc_info=True)
+    return None
+
+
 def take_acted(thread: str) -> bool:
     with _acted_lock:
         if thread in _acted:
@@ -607,6 +633,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._client_secret = _setting(extra, "client_secret", "BRIEFLING_CLIENT_SECRET")
         spaces = extra.get("spaces") or _setting(extra, "spaces", "BRIEFLING_SPACES")
         self._spaces = [s.strip() for s in (spaces.split(",") if isinstance(spaces, str) else spaces) if s and s.strip()]
+        # space -> the agent's own clone mounted alone in a session's sandbox (projects.py); empty = feature off
+        self._projects_root = _setting(extra, "projects_root", "BRIEFLING_PROJECTS_ROOT")
+        self._projects = proj.parse_projects(extra.get("projects") or _setting(extra, "projects", "BRIEFLING_PROJECTS"))
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
         self._task: Optional[asyncio.Task] = None
@@ -2618,6 +2647,7 @@ def register(ctx) -> None:
         ctx.register_hook("post_api_request", on_post_api_request)
         ctx.register_hook("post_auxiliary_call", on_post_auxiliary_call)
         ctx.register_hook("pre_tool_call", on_pre_tool_call)  # turn.ended.acted after a stop
+        ctx.register_hook("pre_llm_call", on_pre_llm_call)  # the space's project mounted in the session's sandbox
         try:  # secrets masked in tool results before the model sees them; an older Hermes may not know the hook
             ctx.register_hook("transform_tool_result", vault.transform_tool_result)
         except Exception as e:

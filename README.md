@@ -71,6 +71,23 @@ connection and again on every settings save, applied at once (no restart). Choos
 the hub as much as the host. Then leave `BRIEFLING_ALLOWED_USERS` and `GATEWAY_ALLOWED_USERS` empty: Hermes checks an
 environment list first. Until the hub's list arrives, nobody is allowed.
 
+## One project per conversation (Docker sandbox)
+
+With Hermes' Docker backend in per-session isolation (`terminal.backend: docker`, `terminal.container_persistent:
+false`, `terminal.docker_mount_cwd_to_workspace: true`), the plugin mounts in each conversation's sandbox, at
+`/workspace`, the project of its space and nothing else. The map is declared on the agent host, never by a tool or a
+message:
+
+- `BRIEFLING_PROJECTS_ROOT`: absolute folder holding the agent's own clones, one per project
+  (`<root>/<org>/<project>`). Use a folder of the agent's own, not the host's working copies: a git hook or a
+  `core.fsmonitor` written from the sandbox would run on the host at its next `git` command there.
+- `BRIEFLING_PROJECTS`: `space=org/project` pairs, comma separated (`liseuse=acme/liseuse,jul=acme/jul`).
+
+Refused, so nothing mounted: a space without an entry, a malformed entry, a folder that does not exist, leaves the
+root (`..`, symlink) or lies under `~/projects`, `/root` or `/workspace` (never mounted by Hermes). The folder is registered once per conversation, before its first
+tool call (`pre_llm_call` hook); an agent's `cd` survives the later turns. Without `BRIEFLING_PROJECTS` the plugin
+changes nothing. Two conversations of the same space share the folder: one git worktree per conversation inside it.
+
 ## Cron jobs: a report as a new Lounge topic
 
 `deliver=briefling:<space id>` on a cron job opens a topic in that space's Lounge with the job's output as its first
