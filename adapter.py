@@ -111,6 +111,7 @@ from . import preview as pv
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
+    clean_context,
     MAX_ACTION,
     NO_TEXT,
     MAX_ABOUT,
@@ -207,7 +208,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.44"
+VERSION = "0.3.45"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1091,7 +1092,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         finally:
             self._waiting.pop(cid, None)
 
-    async def propose_thread(self, thread: str, title: str, why: str = "", brief: str = "", space: str = "") -> Dict[str, Any]:
+    async def propose_thread(self, thread: str, title: str, why: str = "", brief: str = "", space: str = "", context: str = "") -> Dict[str, Any]:
         """Ask the hub to show the "Make it a thread?" card in this topic or thread (`space`: a topic in another
         space's Lounge instead). The hub decides (gates)."""
         frame: Dict[str, Any] = {"type": "thread.propose", "thread": thread, "title": title.strip()[:120]}
@@ -1101,6 +1102,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             frame["why"] = why.strip()[:500]
         if brief.strip():
             frame["brief"] = brief.strip()[:MAX_BRIEF]
+        if context.strip():
+            frame["context"] = context.strip()
         try:
             ack = await self._request(frame)
         except HubRefused as e:
@@ -1788,8 +1791,11 @@ def propose_thread_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error("title and brief are required.")
     if len(brief) > MAX_BRIEF:
         return tool_error(f"brief too long ({len(brief)} chars, max {MAX_BRIEF}): keep 3 to 5 lines.")
+    context, cerr = clean_context(args)
+    if cerr:
+        return tool_error(cerr)
     space = str(args.get("space") or "").strip()
-    return _on_adapter("propose_thread", thread, lambda a: a.propose_thread(thread, title, str(args.get("why") or ""), brief, space))
+    return _on_adapter("propose_thread", thread, lambda a: a.propose_thread(thread, title, str(args.get("why") or ""), brief, space, context))
 
 
 def propose_issue_tool(args: Dict[str, Any], **_: Any) -> str:
