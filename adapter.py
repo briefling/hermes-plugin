@@ -212,7 +212,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.47"
+VERSION = "0.3.48"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1260,7 +1260,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         return thread in self._spoke
 
     async def turn_outcome(self, thread: str, outcome: str, action: str = "",
-                           summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                           summary: Optional[Dict[str, Any]] = None, resume: bool = False) -> Dict[str, Any]:
         """Tell the hub how this turn ends (done, or waiting for a human action), with the thread's summary if given.
         The hub applies the gates."""
         if outcome == "waiting" and not await self._has_spoken(thread):
@@ -1268,6 +1268,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         frame: Dict[str, Any] = {"type": "thread.outcome", "thread": thread, "outcome": outcome}
         if outcome == "waiting":
             frame["action"] = " ".join(action.split())[:MAX_ACTION]
+            if resume:
+                frame["resume"] = True
         if summary:
             frame["summary"] = summary
         try:
@@ -1949,10 +1951,13 @@ def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error("action is required for 'waiting': what must the human do?")
     if len(action) > MAX_ACTION:
         return tool_error(f"action too long ({len(action)} chars, max {MAX_ACTION}): one short line.")
+    resume = args.get("resume")
+    if resume is not None and not isinstance(resume, bool):
+        return tool_error("resume must be true or false.")
     summary, err = clean_summary(args.get("summary"))
     if err:
         return tool_error(err)
-    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary))
+    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary, resume is True))
 
 
 def _resource_args(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:

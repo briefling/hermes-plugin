@@ -830,7 +830,9 @@ OUTCOME_SCHEMA = {
         "'done' = your work is finished, nothing expected from the human. "
         "'waiting' = finished on your side, but you need the human to do something before it is really over "
         "(e.g. '/restart the gateway', 'approve PR #12', 'add secret X'); the thread stays in their 'Your turn' list, "
-        "showing the action, until they reply or click 'Done'. Not for a question (use ask_choices or plain text). "
+        "showing the action, until they reply or click 'Done'. Set resume=true when you will carry on after that "
+        "action ('tell me Done and I continue'): their 'Done' then reaches you as their reply. "
+        "Not for a question (use ask_choices or plain text). "
         "Before 'waiting', write your whole answer as message text in this thread (findings, options, the question): "
         "the action is only a short banner label, and 'waiting' is refused if nothing was posted during this turn. "
         "If you are still working or waiting on a third party, don't call it. "
@@ -847,6 +849,10 @@ OUTCOME_SCHEMA = {
             "action": {"type": "string", "description": (
                 "Required for 'waiting': the action expected from the human, one short imperative line (max 200 chars), "
                 "in the team's language. A label for the banner, never the answer itself.")},
+            "resume": {"type": "boolean", "description": (
+                "'waiting' only. true = you carry on once the human did the action (e.g. you said 'tell me Done and I "
+                "continue'): their 'Done' button then posts 'Done' as their reply and wakes you in this thread. "
+                "false or absent = the action closes the task: 'Done' just marks the thread finished, nothing reaches you.")},
             "summary": {
                 "type": "object",
                 "description": (
