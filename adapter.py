@@ -132,6 +132,9 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     build_plan,
     RADAR_ERRORS,
     RADAR_SIGNAL_SCHEMA,
+    MAIL_IMPORT_SCHEMA,
+    MAIL_ERRORS,
+    build_mail_import,
     RADAR_PROFILE_SCHEMA,
     RADAR_PROFILE_SENT,
     RADAR_PROFILE_ERRORS,
@@ -209,7 +212,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.46"
+VERSION = "0.3.47"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -897,7 +900,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
             for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
-        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result",
+        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result", "mail.imported",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1162,6 +1165,23 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "signal": ack.get("msg_id"), "detail": RADAR_RECORDED}
+
+    async def mail_import(self, thread: str, mails: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """mail.import, one frame per mail (each fits one WebSocket frame): per mail imported / known / refused."""
+        results: List[Dict[str, Any]] = []
+        for m in mails:
+            mid = m.get("message_id")
+            try:
+                r = await self._request({"type": "mail.import", "thread": thread, "mail": m})
+                results.append({"message_id": mid, "result": r.get("result"), "exchange": r.get("exchange"), "state": r.get("state")})
+            except HubRefused as e:
+                if e.code in ("no_turn", "not_lead", "forbidden"):  # the same for every mail: stop here
+                    return {"ok": False, "error": e.code, "detail": MAIL_ERRORS.get(e.code, e.code), "results": results}
+                results.append({"message_id": mid, "result": "refused", "error": e.code, "detail": MAIL_ERRORS.get(e.code, e.code)})
+            except (ConnectionError, asyncio.TimeoutError):
+                return {**HUB_UNREACHABLE, "results": results}
+        counts = {k: sum(1 for r in results if r["result"] == k) for k in ("imported", "known", "refused")}
+        return {"ok": True, **counts, "results": results}
 
     async def radar_profile(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
         """radar.profile: the profile deduced in the hidden Radar profile pass (an admin validates it)."""
@@ -1793,7 +1813,7 @@ def _session_thread(tool: str) -> Tuple[Optional[str], Optional[str]]:
     return get_session_env("HERMES_SESSION_CHAT_ID", ""), None
 
 
-def _on_adapter(tool: str, thread: str, call) -> str:
+def _on_adapter(tool: str, thread: str, call, timeout: float = 30) -> str:
     """Run ``call(adapter)`` on the gateway loop of the adapter serving ``thread`` (tools run in the agent's Python thread)."""
     from tools.registry import tool_error
     adapter = next((a for a in list(_ADAPTERS) if thread in a._thread_space), None)
@@ -1805,7 +1825,7 @@ def _on_adapter(tool: str, thread: str, call) -> str:
     except RuntimeError:
         pass
     fut = asyncio.run_coroutine_threadsafe(call(adapter), adapter._loop)
-    return json.dumps(fut.result(timeout=30), ensure_ascii=False)
+    return json.dumps(fut.result(timeout=timeout), ensure_ascii=False)
 
 
 def propose_thread_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2365,6 +2385,18 @@ def radar_signal_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("radar_signal", thread, lambda a: a.radar_signal(thread, frame))
 
 
+def mail_import_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: mail.import (a lead's turn only; the hub checks the turn, the correspondents and each mail)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("mail_import")
+    if err:
+        return tool_error(err)
+    mails, merr = build_mail_import(args)
+    if merr:
+        return tool_error(merr)
+    return _on_adapter("mail_import", thread, lambda a: a.mail_import(thread, mails), timeout=20 + 10 * len(mails))
+
+
 def radar_profile_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: radar.profile (hidden profile pass only; the hub checks the pass and the turn)."""
     from tools.registry import tool_error
@@ -2615,6 +2647,8 @@ def register(ctx) -> None:
                                 (SPACE_METRICS_SCHEMA, space_metrics_tool)):
             ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
                               description=schema["description"], emoji="🔎")
+        ctx.register_tool(name="mail_import", toolset="briefling", schema=MAIL_IMPORT_SCHEMA, handler=mail_import_tool,
+                          description=MAIL_IMPORT_SCHEMA["description"], emoji="✉️")
         ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
                           description=RADAR_SIGNAL_SCHEMA["description"], emoji="📡")
         ctx.register_tool(name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,
