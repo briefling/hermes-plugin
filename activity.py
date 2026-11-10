@@ -35,7 +35,7 @@ _WRAPPER_TOOLS = frozenset({"tool_call"})
 _SCRIPT_TOOLS = frozenset({"execute_code"})
 # Talking to the humans of the thread (briefling tools): the call is part of the answer.
 _ANSWER_TOOLS = frozenset({
-    "turn_outcome", "propose_thread", "propose_issue", "propose_plan", "propose_space_about", "topic_title",
+    "turn_outcome", "propose_thread", "propose_issue", "propose_plan", "propose_space_about", "applet_propose", "topic_title",
     "ask_choices", "request_elevation", "radar_signal", "radar_profile", "clarify", "send_message", "text_to_speech",
 })
 

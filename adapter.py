@@ -148,6 +148,9 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     OUTCOME_ERRORS,
     RESOURCE_ERRORS,
     ABOUT_ERRORS,
+    APPLET_ERRORS,
+    APPLET_PROPOSE_SCHEMA,
+    build_applet_propose,
     TITLE_ERRORS,
     TOPIC_HEADING_MAX,
     TOPIC_TITLE_SCHEMA,
@@ -216,7 +219,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.54"
+VERSION = "0.3.55"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1277,6 +1280,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         return {"ok": True, "card": ack.get("msg_id"),
                 "detail": CARD_SHOWN["propose_space_about"]}
 
+    async def applet_propose(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """applet.propose: an applet card in the conversation. Never saved by the agent: a lead saves it."""
+        try:
+            ack = await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": APPLET_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["applet_propose"]}
+
     async def topic_title(self, thread: str, title: str) -> Dict[str, Any]:
         """Title a new Lounge topic (``thread`` = the topic, or the hidden conversation briefling opened for it)."""
         try:
@@ -1960,6 +1973,18 @@ def propose_space_about_tool(args: Dict[str, Any], **_: Any) -> str:
     if len(text) > MAX_ABOUT:
         return tool_error(f"description too long ({len(text)} chars, max {MAX_ABOUT}): keep it short, it is read on every turn.")
     return _on_adapter("propose_space_about", thread, lambda a: a.propose_space_about(thread, text, str(args.get("why") or "")))
+
+
+def applet_propose_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: applet.propose (a card; the hub checks the lead's turn, the agent and the schema)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("applet_propose")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_applet_propose(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("applet_propose", thread, lambda a: a.applet_propose(thread, frame))
 
 
 def topic_title_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2721,6 +2746,8 @@ def register(ctx) -> None:
                           description=EXCHANGE_READ_SCHEMA["description"], emoji="📨")
         ctx.register_tool(name="exchange_summary", toolset="briefling", schema=EXCHANGE_SUMMARY_SCHEMA, handler=exchange_summary_tool,
                           description=EXCHANGE_SUMMARY_SCHEMA["description"], emoji="🧾")
+        ctx.register_tool(name="applet_propose", toolset="briefling", schema=APPLET_PROPOSE_SCHEMA, handler=applet_propose_tool,
+                          description=APPLET_PROPOSE_SCHEMA["description"], emoji="🧩")
         ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
                           description=RADAR_SIGNAL_SCHEMA["description"], emoji="📡")
         ctx.register_tool(name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,
