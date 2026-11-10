@@ -39,6 +39,14 @@ PREVIEW_ERRORS = ("not_shared", "not_connected", "preview_off", "gone", "no_brow
 DEVICE_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}")  # protocol/preview.ts PREVIEW_DEVICE_RE (fullmatch)
 MAX_PEERS = 3
 PEER_MAX_S = 30 * 60
+
+
+def peer_life(max_s: Any) -> int:
+    """Seconds a peer may live: PEER_MAX_S, or less for a visitor link (`max_s` of preview.offer: the time left before
+    its deadline, protocol/preview.ts « Visitor link »). Anything but a positive int is ignored."""
+    if isinstance(max_s, int) and not isinstance(max_s, bool) and max_s > 0:
+        return min(PEER_MAX_S, max_s)
+    return PEER_MAX_S
 PROBE_TIMEOUT_S = 15                      # docker exec + python start, the probe itself waits 1 s
 LOG_LINE_MAX = 200
 PEER_SOURCE = (Path(__file__).with_name("preview_peer.py")).read_text(encoding="utf-8")
@@ -492,6 +500,7 @@ class Previews:
         if share is None or share["msg"] != msg:
             return await self._failed(session, "gone")
         sdp, ice = frame.get("sdp"), frame.get("ice")
+        life = peer_life(frame.get("max_s"))
         if not sdp_ok(sdp) or not isinstance(ice, list):
             return await self._failed(session, "peer_failed")
         with self.lock:
@@ -506,7 +515,7 @@ class Previews:
         # The TURN credentials (ice) and a voice url-file path travel on stdin only; the command line carries the
         # source and a random tag.
         what = {"voice_file": share.get("voice_file")} if kind == "voice" else {("device" if kind == "screen" else "port"): port}
-        stdin = json.dumps({**what, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)], "max_s": PEER_MAX_S}) + "\n"
+        stdin = json.dumps({**what, "sdp": sdp, "ice": [s for s in ice if isinstance(s, dict)], "max_s": life}) + "\n"
         try:
             peer.ctx = ctx = share.get("ctx")
             peer.env = await self.loop.run_in_executor(None, lambda: in_turn_context(ctx, lambda: self.session_env(share.get("env"))))
@@ -526,7 +535,7 @@ class Previews:
         if peer.closing:  # closed while it was starting
             self._kill_async(peer)
             return
-        peer.timer = self.loop.call_later(PEER_MAX_S, self.close, session)
+        peer.timer = self.loop.call_later(life, self.close, session)
         threading.Thread(target=self._read, args=(peer,), daemon=True, name=f"preview-{peer.tag}").start()
         logger.info("[briefling] preview peer started for %s (%d live)", target_what(port), len(self.peers))
 
