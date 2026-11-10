@@ -133,6 +133,10 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     RADAR_ERRORS,
     RADAR_SIGNAL_SCHEMA,
     MAIL_IMPORT_SCHEMA,
+    EXCHANGE_ERRORS,
+    EXCHANGE_READ_SCHEMA,
+    EXCHANGE_SUMMARY_SCHEMA,
+    build_exchange_summary,
     MAIL_ERRORS,
     build_mail_import,
     RADAR_PROFILE_SCHEMA,
@@ -212,7 +216,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.48"
+VERSION = "0.3.49"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -900,7 +904,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
             for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
-        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result", "mail.imported",
+        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1182,6 +1186,27 @@ class BrieflingAdapter(BasePlatformAdapter):
                 return {**HUB_UNREACHABLE, "results": results}
         counts = {k: sum(1 for r in results if r["result"] == k) for k in ("imported", "known", "refused")}
         return {"ok": True, **counts, "results": results}
+
+    async def exchange_read(self, thread: str, xid: str) -> Dict[str, Any]:
+        """exchange.read: one exchange of the hidden summary run, its mails as untrusted data (the hub's note first)."""
+        try:
+            r = await self._request({"type": "exchange.read", "thread": thread, "id": xid})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": EXCHANGE_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "note": r.get("note"), "exchange": r.get("exchange"), "summary": r.get("summary"),
+                "requests": r.get("requests") or [], "mails": r.get("mails") or []}
+
+    async def exchange_summary(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """exchange.summary: the summary, new requests and settled ones of one exchange of the run."""
+        try:
+            await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": EXCHANGE_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "detail": "Summary recorded. Go on with the next exchange of the run; post nothing."}
 
     async def radar_profile(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
         """radar.profile: the profile deduced in the hidden Radar profile pass (an admin validates it)."""
@@ -2402,6 +2427,30 @@ def mail_import_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("mail_import", thread, lambda a: a.mail_import(thread, mails), timeout=20 + 10 * len(mails))
 
 
+def exchange_read_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: exchange.read (hidden summary run only; the hub checks the run, the turn and the exchange)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("exchange_read")
+    if err:
+        return tool_error(err)
+    xid = str(args.get("id") or "").strip()
+    if not xid:
+        return tool_error("id is required.")
+    return _on_adapter("exchange_read", thread, lambda a: a.exchange_read(thread, xid))
+
+
+def exchange_summary_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: exchange.summary (hidden summary run only)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("exchange_summary")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_exchange_summary(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("exchange_summary", thread, lambda a: a.exchange_summary(thread, frame))
+
+
 def radar_profile_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: radar.profile (hidden profile pass only; the hub checks the pass and the turn)."""
     from tools.registry import tool_error
@@ -2654,6 +2703,10 @@ def register(ctx) -> None:
                               description=schema["description"], emoji="🔎")
         ctx.register_tool(name="mail_import", toolset="briefling", schema=MAIL_IMPORT_SCHEMA, handler=mail_import_tool,
                           description=MAIL_IMPORT_SCHEMA["description"], emoji="✉️")
+        ctx.register_tool(name="exchange_read", toolset="briefling", schema=EXCHANGE_READ_SCHEMA, handler=exchange_read_tool,
+                          description=EXCHANGE_READ_SCHEMA["description"], emoji="📨")
+        ctx.register_tool(name="exchange_summary", toolset="briefling", schema=EXCHANGE_SUMMARY_SCHEMA, handler=exchange_summary_tool,
+                          description=EXCHANGE_SUMMARY_SCHEMA["description"], emoji="🧾")
         ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
                           description=RADAR_SIGNAL_SCHEMA["description"], emoji="📡")
         ctx.register_tool(name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,
