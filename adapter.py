@@ -149,6 +149,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     RESOURCE_ERRORS,
     ABOUT_ERRORS,
     APPLET_ERRORS,
+    APPLET_LIST_SCHEMA,
     APPLET_PROPOSE_SCHEMA,
     build_applet_propose,
     TITLE_ERRORS,
@@ -219,7 +220,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.55"
+VERSION = "0.3.56"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -914,7 +915,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
             for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
-        elif kind in ("upload.ready", "ack", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result", "mail.imported", "exchange.read",
+        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "flow.result", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1289,6 +1290,17 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["applet_propose"]}
+
+    async def applet_list(self, thread: str) -> Dict[str, Any]:
+        """applet.list (agent): the space's applets as saved, to update one with applet_propose."""
+        try:
+            r = await self._request({"type": "applet.list", "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": APPLET_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        keep = ("id", "version", "name", "description", "emoji", "agent", "instruction", "fields", "leadsOnly")
+        return {"ok": True, "applets": [{k: x[k] for k in keep if k in x} for x in r.get("applets") or []]}
 
     async def topic_title(self, thread: str, title: str) -> Dict[str, Any]:
         """Title a new Lounge topic (``thread`` = the topic, or the hidden conversation briefling opened for it)."""
@@ -1985,6 +1997,15 @@ def applet_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     if ferr:
         return tool_error(ferr)
     return _on_adapter("applet_propose", thread, lambda a: a.applet_propose(thread, frame))
+
+
+def applet_list_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: applet.list (the space's applets, in a turn)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("applet_list")
+    if err:
+        return tool_error(err)
+    return _on_adapter("applet_list", thread, lambda a: a.applet_list(thread))
 
 
 def topic_title_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2748,6 +2769,8 @@ def register(ctx) -> None:
                           description=EXCHANGE_SUMMARY_SCHEMA["description"], emoji="🧾")
         ctx.register_tool(name="applet_propose", toolset="briefling", schema=APPLET_PROPOSE_SCHEMA, handler=applet_propose_tool,
                           description=APPLET_PROPOSE_SCHEMA["description"], emoji="🧩")
+        ctx.register_tool(name="applet_list", toolset="briefling", schema=APPLET_LIST_SCHEMA, handler=applet_list_tool,
+                          description=APPLET_LIST_SCHEMA["description"], emoji="🧩")
         ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
                           description=RADAR_SIGNAL_SCHEMA["description"], emoji="📡")
         ctx.register_tool(name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,

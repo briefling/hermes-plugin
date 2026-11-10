@@ -1781,6 +1781,8 @@ APPLET_FIELDS_MAX = 12
 APPLET_FILE_FIELDS_MAX = 5
 APPLET_KINDS = ("text", "textarea", "select", "file")
 APPLET_FIELD_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+APPLET_DESC_MAX = 200
+APPLET_EMOJI_MAX = 16
 
 APPLET_ERRORS = {
     "no_turn": "Only during a turn started by a lead of the space (not a member's or a contributor's message, not a board task).",
@@ -1791,7 +1793,17 @@ APPLET_ERRORS = {
     "bad_frame": (f"Invalid applet: name 1-{APPLET_NAME_MAX} chars on one line; instruction 1-{APPLET_INSTRUCTION_MAX}; "
                   f"1-{APPLET_FIELDS_MAX} fields, each with a unique id (lowercase, [a-z][a-z0-9_]), a label of 1-80 chars, a kind "
                   f"in {', '.join(APPLET_KINDS)}; a select needs 2-20 distinct options (only a select has options); "
-                  f"{APPLET_FILE_FIELDS_MAX} file fields at most."),
+                  f"{APPLET_FILE_FIELDS_MAX} file fields at most; description: one line of {APPLET_DESC_MAX} chars at most; emoji: "
+        "one emoji, nothing else."),
+}
+
+APPLET_LIST_SCHEMA = {
+    "name": "applet_list",
+    "description": (
+        "briefling only, during a turn: the applets saved in this space (id, version, name, description, emoji, agent, "
+        "instruction, fields, who launches). Read it before proposing an update with applet_propose (pass the id)."
+    ),
+    "parameters": {"type": "object", "properties": {}},
 }
 
 APPLET_PROPOSE_SCHEMA = {
@@ -1802,13 +1814,16 @@ APPLET_PROPOSE_SCHEMA = {
         "values and files, and sends you the instruction with the values; you deliver the document as an attachment "
         "(MEDIA:<path>) and end with turn_outcome done, which closes the thread. Write the instruction for that future "
         "run: what to produce from which fields, the format and file name, never secrets. It only posts a card; a lead "
-        "saves it. To change an existing applet, pass its id (shown in the space's Applets menu or given by the lead)."
+        "saves it. To change an existing applet, call applet_list for its id and current content, then pass the id with "
+        "the full new version (every field, not only the changes)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "name": {"type": "string", "description": f"Short name shown in the Applets menu (max {APPLET_NAME_MAX} chars)."},
             "agent": {"type": "string", "description": "The agent that runs it (an agent of this space; usually you, lowercase id)."},
+            "description": {"type": "string", "description": f"One line shown on its tile in the Applets menu: what it produces (max {APPLET_DESC_MAX} chars)."},
+            "emoji": {"type": "string", "description": "Its illustration on the tile: ONE emoji that pictures the result (e.g. 📄, 🧾, 📊). No text, no image."},
             "instruction": {"type": "string", "description": f"What the agent does at each launch (max {APPLET_INSTRUCTION_MAX} chars), in the team's language."},
             "fields": {
                 "type": "array", "description": f"The form, in display order (1-{APPLET_FIELDS_MAX}).",
@@ -1871,7 +1886,18 @@ def build_applet_propose(args: Dict[str, Any]) -> "tuple[Dict[str, Any] | None, 
         return None, "field ids must be unique."
     if sum(1 for f in out if f["kind"] == "file") > APPLET_FILE_FIELDS_MAX:
         return None, f"{APPLET_FILE_FIELDS_MAX} file fields at most."
-    frame: Dict[str, Any] = {"type": "applet.propose", "draft": {"name": name, "agent": agent, "instruction": instruction, "fields": out}}
+    draft: Dict[str, Any] = {"name": name, "agent": agent, "instruction": instruction, "fields": out}
+    desc = str(args.get("description") or "").strip()
+    if desc:
+        if len(desc) > APPLET_DESC_MAX or "\n" in desc:
+            return None, f"description: one line of {APPLET_DESC_MAX} chars at most."
+        draft["description"] = desc
+    emoji = str(args.get("emoji") or "").strip()
+    if emoji:
+        if len(emoji) > APPLET_EMOJI_MAX or any(ch.isalnum() or ch.isspace() or ch in "<>&\"'" for ch in emoji):
+            return None, "emoji: one emoji only (no text)."
+        draft["emoji"] = emoji
+    frame: Dict[str, Any] = {"type": "applet.propose", "draft": draft}
     aid = str(args.get("id") or "").strip()
     if aid:
         if not ID_RE.match(aid):
