@@ -216,7 +216,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.53"
+VERSION = "0.3.54"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -326,6 +326,13 @@ def is_connected(config) -> bool:
 
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 100 * 1024 * 1024  # zip archives, as the hub allows them (protocol/frames.ts maxFileBytes)
+ARCHIVE_MIME = {"application/zip", "application/x-zip-compressed"}
+
+
+def max_file_bytes(mime: str) -> int:
+    """Size cap of one attachment, in and out, by its declared type: 100 MB for a zip, 20 MB for the rest."""
+    return MAX_ARCHIVE_BYTES if mime in ARCHIVE_MIME else MAX_FILE_BYTES
 MAX_FILES = 10
 INLINE_IMAGES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 # Outbound audio: a fixed type per extension (mimetypes differs between macOS and Linux and lacks some), each one the
@@ -1036,17 +1043,19 @@ class BrieflingAdapter(BasePlatformAdapter):
             url, mime, name = f.get("url"), str(f.get("mime") or "application/octet-stream"), str(f.get("name") or "file")
             if not is_s3_url(url) or not self._session:
                 continue
+            cap = max_file_bytes(mime)
             try:
-                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
-                    if r.status != 200 or (r.content_length or 0) > MAX_FILE_BYTES:
+                # 100 MB at a few MB/s: the timeout follows the cap (60 s per 20 MB).
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=60 * cap // MAX_FILE_BYTES)) as r:
+                    if r.status != 200 or (r.content_length or 0) > cap:
                         continue
                     # StreamReader.read(n) returns what is buffered (one chunk), not n bytes: read until EOF, capped.
                     buf = bytearray()
                     async for chunk in r.content.iter_chunked(65536):
                         buf += chunk
-                        if len(buf) > MAX_FILE_BYTES:
+                        if len(buf) > cap:
                             break
-                    if len(buf) > MAX_FILE_BYTES or (r.content_length is not None and len(buf) != r.content_length):
+                    if len(buf) > cap or (r.content_length is not None and len(buf) != r.content_length):
                         continue
                     data = bytes(buf)
                 if mime in INLINE_IMAGES:
@@ -1101,10 +1110,10 @@ class BrieflingAdapter(BasePlatformAdapter):
         if not space or not self._session or not os.path.isfile(path):
             return None
         size = os.path.getsize(path)
-        if not 0 < size <= MAX_FILE_BYTES:
-            return None
         name = file_name or os.path.basename(path)
         mime = AUDIO_TYPES.get(os.path.splitext(name)[1].lower()) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        if not 0 < size <= max_file_bytes(mime):
+            return None
         try:
             ready = await self._request({"type": "upload", "space": space, "name": name, "mime": mime, "size": size})
         except Exception as e:
@@ -1115,7 +1124,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             form.add_field(k, v)
         with open(path, "rb") as fh:
             form.add_field("file", fh, filename=name, content_type=mime)  # must be the last field
-            async with self._session.post(ready["post"]["url"], data=form, timeout=aiohttp.ClientTimeout(total=120)) as r:
+            async with self._session.post(ready["post"]["url"], data=form, timeout=aiohttp.ClientTimeout(total=120 * max_file_bytes(mime) // MAX_FILE_BYTES)) as r:
                 if r.status not in (200, 201, 204):
                     logger.warning("[%s] S3 upload failed: %s", self.name, r.status)
                     return None
