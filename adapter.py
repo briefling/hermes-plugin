@@ -216,7 +216,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.49"
+VERSION = "0.3.50"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -949,7 +949,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         if not MessageEvent(text=text).get_command():
             text = with_context(frame.get("context") or {},
                                 vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True
-                                 else VOICE_TALK_HINT if self._previews.share_of(thread, pv.VOICE) else "") + text)
+                                 else VOICE_TALK_HINT if self._previews.share_of(thread, pv.VOICE) else "") + text,
+                                mounted=self._mounted(str(frame.get("space") or "")))
         source = self.build_source(
             chat_id=thread, chat_name=self._titles[thread], chat_type="dm",
             user_id=str(author.get("id") or ""), user_name=str(frame.get("author_name") or author.get("id") or ""), message_id=msg_id)
@@ -1019,6 +1020,10 @@ class BrieflingAdapter(BasePlatformAdapter):
         task = asyncio.ensure_future(self.handle_message(event))
         self._stop_tasks.add(task)
         task.add_done_callback(self._stop_tasks.discard)
+
+    def _mounted(self, space: str) -> bool:
+        """This space's project folder is mounted in the session's sandbox (projects.py, same check as the hook)."""
+        return bool(self._projects and space and proj.project_dir(self._projects_root, self._projects, space))
 
     async def _download_files(self, files: List[Dict[str, Any]]) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
         """Download attachments from their presigned S3 URLs into the Hermes media cache → (paths, mimes, kept
