@@ -149,6 +149,9 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     RESOURCE_ERRORS,
     ABOUT_ERRORS,
     APPLET_ERRORS,
+    REMINDER_ERRORS,
+    REMINDER_PROPOSE_SCHEMA,
+    build_reminder_propose,
     APPLET_LIST_SCHEMA,
     APPLET_PROPOSE_SCHEMA,
     build_applet_propose,
@@ -220,7 +223,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.57"
+VERSION = "0.3.58"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1291,6 +1294,16 @@ class BrieflingAdapter(BasePlatformAdapter):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["applet_propose"]}
 
+    async def reminder_propose(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """reminder.propose: a reminder card in the conversation. Never saved by the agent: a member adds it."""
+        try:
+            ack = await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": REMINDER_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["reminder_propose"]}
+
     async def applet_list(self, thread: str) -> Dict[str, Any]:
         """applet.list (agent): the space's applets as saved, to update one with applet_propose."""
         try:
@@ -1997,6 +2010,18 @@ def applet_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     if ferr:
         return tool_error(ferr)
     return _on_adapter("applet_propose", thread, lambda a: a.applet_propose(thread, frame))
+
+
+def reminder_propose_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: reminder.propose (a card; the hub checks the turn, the module and the fields)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("reminder_propose")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_reminder_propose(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("reminder_propose", thread, lambda a: a.reminder_propose(thread, frame))
 
 
 def applet_list_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2769,6 +2794,8 @@ def register(ctx) -> None:
                           description=EXCHANGE_SUMMARY_SCHEMA["description"], emoji="🧾")
         ctx.register_tool(name="applet_propose", toolset="briefling", schema=APPLET_PROPOSE_SCHEMA, handler=applet_propose_tool,
                           description=APPLET_PROPOSE_SCHEMA["description"], emoji="🧩")
+        ctx.register_tool(name="reminder_propose", toolset="briefling", schema=REMINDER_PROPOSE_SCHEMA, handler=reminder_propose_tool,
+                          description=REMINDER_PROPOSE_SCHEMA["description"], emoji="⏰")
         ctx.register_tool(name="applet_list", toolset="briefling", schema=APPLET_LIST_SCHEMA, handler=applet_list_tool,
                           description=APPLET_LIST_SCHEMA["description"], emoji="🧩")
         ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,

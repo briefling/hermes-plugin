@@ -48,6 +48,8 @@ CARD_SHOWN = {
     "propose_space_about": f"Draft {_AFTER_TEXT}; the admin reviews it, applies it to the space settings and saves.",
     "applet_propose": (f"Applet card {_AFTER_TEXT}; nothing is saved until a lead of the space clicks Save the applet. "
                        "It then appears in the space's Applets menu, where a lead launches it."),
+    "reminder_propose": (f"Reminder card {_AFTER_TEXT}; nothing is saved until a member of the space clicks Add (they pick "
+                         "the list and who it is for). It then shows in the space's Reminders, with a notification when due."),
     "ask_choices": (f"Card {_AFTER_TEXT}. End your turn now (in a thread: turn_outcome waiting, action 'answer the "
                     "card'); do not repeat the questions in text. The human's choices come back as your next message, "
                     "one line « label → choice » per point; a message they write instead is their answer."),
@@ -1811,6 +1813,71 @@ def build_exchange_summary(args: Dict[str, Any]) -> "tuple[Dict[str, Any] | None
         return None, EXCHANGE_ERRORS["bad_done"]
     return {"type": "exchange.summary", "id": xid, "status": status, "decisions": [d.strip() for d in decisions], "through": through,
             "requests": out, "done": done}, None
+
+
+# -- Reminders (protocol/reminders.ts): the agent proposes a reminder card, a member adds it (module `reminders`).
+REMINDER_TITLE_MAX = 200  # protocol/reminders.ts
+REMINDER_NOTES_MAX = 2000
+REMINDER_DATE_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+REMINDER_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+REMINDER_ERRORS = {
+    "module_off": "Reminders are off in this space (an admin turns the module on in its settings): tell the human instead.",
+    "no_turn": "Only during a turn started by a human you act for.",
+    "forbidden": "Not allowed here.",
+    "bad_frame": (f"Invalid reminder: title 1-{REMINDER_TITLE_MAX} chars on one line; notes {REMINDER_NOTES_MAX} chars at most; "
+                  "date YYYY-MM-DD (a real day); time HH:MM, only with a date; tz an IANA zone such as Europe/Paris."),
+}
+REMINDER_PROPOSE_SCHEMA = {
+    "name": "reminder_propose",
+    "description": (
+        "briefling only, when a human asks you to remind them (or someone of the space) of something: posts a reminder "
+        "card in this conversation. A member clicks Add, picking the list and who it is for; the reminder then shows in "
+        "the space's Reminders view and that person gets a notification when it is due. It only posts a card, never "
+        "a reminder. Only in a space whose Reminders module is on. Resolve relative dates (« demain », « vendredi ») to "
+        "YYYY-MM-DD yourself from today's date; no date = a plain to-do; a date without time notifies at 09:00."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": f"What to do, short, in the team's language (max {REMINDER_TITLE_MAX} chars, one line)."},
+            "date": {"type": "string", "description": "Due day, YYYY-MM-DD (optional)."},
+            "time": {"type": "string", "description": "Due time, HH:MM 24 h (optional, needs a date)."},
+            "tz": {"type": "string", "description": "IANA time zone of the date and time (default Europe/Paris)."},
+            "notes": {"type": "string", "description": f"Optional details shown under the title (max {REMINDER_NOTES_MAX} chars)."},
+            "why": {"type": "string", "description": "Optional sentence shown on the card: why this reminder."},
+        },
+        "required": ["title"],
+    },
+}
+
+
+def build_reminder_propose(args: Dict[str, Any]) -> "tuple[Dict[str, Any] | None, str | None]":
+    """reminder_propose arguments -> reminder.propose frame (without thread/client_id), or an error. The hub checks it all again."""
+    title = " ".join(str(args.get("title") or "").split())
+    if not title or len(title) > REMINDER_TITLE_MAX:
+        return None, f"title is required: one line of 1-{REMINDER_TITLE_MAX} chars."
+    frame: Dict[str, Any] = {"type": "reminder.propose", "title": title}
+    date, time = str(args.get("date") or "").strip(), str(args.get("time") or "").strip()
+    if date and not REMINDER_DATE_RE.match(date):
+        return None, "date must be YYYY-MM-DD."
+    if time and (not date or not REMINDER_TIME_RE.match(time)):
+        return None, "time must be HH:MM (24 h), and needs a date."
+    if date:
+        frame["date"] = date
+        if time:
+            frame["time"] = time
+        tz = str(args.get("tz") or "").strip()
+        if tz:
+            frame["tz"] = tz
+    notes = str(args.get("notes") or "").strip()
+    if notes:
+        if len(notes) > REMINDER_NOTES_MAX:
+            return None, f"notes: {REMINDER_NOTES_MAX} chars at most."
+        frame["notes"] = notes
+    why = " ".join(str(args.get("why") or "").split())
+    if why:
+        frame["why"] = why[:500]
+    return frame, None
 
 
 # -- Applets (protocol/applets.ts, docs/design-applets.md): the agent proposes, a lead saves.
