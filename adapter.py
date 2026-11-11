@@ -8,7 +8,9 @@ layer. The instance authenticates with a Cognito M2M client (client credentials)
 Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling repo):
 - ``on_processing_start`` / ``on_processing_complete`` -> ``turn.started`` / ``turn.ended``; ``turn.ended`` carries the
   LLM spend of the thread since the previous turn end (``usage``), summed from the ``post_api_request`` and
-  ``post_auxiliary_call`` hooks and priced with Hermes' ``estimate_usage_cost``.
+  ``post_auxiliary_call`` hooks and priced with Hermes' ``estimate_usage_cost``. A run those hooks do not bracket
+  (the wake after a notified background process) opens and closes its turn from ``pre_llm_call`` / ``post_llm_call``,
+  and a message steered into a running run keeps the turn open until that run ends.
 - hub ``turn.stop`` (Stop button) -> the gateway's ``/stop`` on that thread; the turn end then carries ``stopped``
   and ``acted`` (a tool was called during the turn, ``pre_tool_call`` hook).
 - ``send`` / ``edit_message`` -> ``message.final`` (upsert by msg_id, streaming = successive edits)
@@ -223,7 +225,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.58"
+VERSION = "0.3.59"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -505,7 +507,12 @@ def on_pre_tool_call(**_: Any) -> None:
 _unmounted_warned: set = set()
 
 
-def on_pre_llm_call(task_id: str = "", session_id: str = "", **_: Any) -> None:
+def on_pre_llm_call(task_id: str = "", session_id: str = "", turn_id: str = "", parent_session_id: str = "",
+                    **_: Any) -> None:
+    try:
+        _run_started(_usage_thread(), session_id or task_id, turn_id, parent_session_id)
+    except Exception:  # the turn indicator is best effort, the mount below must still run
+        logger.warning("[briefling] agent run start not tracked", exc_info=True)
     try:
         thread = _usage_thread()
         adapter = next((a for a in list(_ADAPTERS) if thread and thread in a._thread_space), None)
@@ -522,6 +529,71 @@ def on_pre_llm_call(task_id: str = "", session_id: str = "", **_: Any) -> None:
     except Exception:  # Hermes then mounts nothing: closed
         logger.warning("[briefling] project mount failed, nothing mounted", exc_info=True)
     return None
+
+
+# -- agent runs the processing hooks do not bracket ------------------------------------------------------------------
+# Hermes fires on_processing_start/complete around a chat message only. A synthetic run (the wake after a notified
+# background process, a /goal continuation) gets neither, and a message steered into a running run gets both at once
+# while the run goes on. pre_llm_call/post_llm_call fire once around EVERY run, so they keep the hub turn open for as
+# long as the agent works: else the thread shows "quiet" and the hub refuses its turn-only frames (no_turn).
+_runs_lock = threading.Lock()
+_runs: Dict[str, Dict[str, str]] = {}  # thread -> {session: turn id} of top-level agent runs in progress
+
+
+def _adapter_of(thread: Optional[str]) -> Optional["BrieflingAdapter"]:
+    return next((a for a in list(_ADAPTERS) if thread and thread in a._thread_space), None)
+
+
+def _on_loop(adapter: "BrieflingAdapter", make, wait: float = 5.0) -> None:
+    """Run ``make()`` on the adapter's loop; waits a little so turn.started goes out before the run's first tool."""
+    loop = adapter._loop
+    if loop is None:
+        return
+    try:
+        if asyncio.get_running_loop() is loop:
+            asyncio.ensure_future(make())
+            return
+    except RuntimeError:
+        pass
+    try:
+        asyncio.run_coroutine_threadsafe(make(), loop).result(timeout=wait)
+    except Exception:
+        logger.debug("[briefling] turn frame not sent", exc_info=True)
+
+
+def _run_started(thread: Optional[str], session: str, turn_id: str, parent: str) -> None:
+    if not thread or parent:
+        return  # a sub-agent works inside its parent's run
+    with _runs_lock:
+        _runs.setdefault(thread, {})[session] = turn_id  # one run per session: a crashed run's entry is replaced
+    adapter = _adapter_of(thread)
+    if adapter is not None and thread not in adapter._turns:
+        _on_loop(adapter, lambda: adapter._start_turn(thread, owed=""))
+
+
+def run_active(thread: str) -> bool:
+    with _runs_lock:
+        return bool(_runs.get(thread))
+
+
+def on_post_llm_call(task_id: str = "", session_id: str = "", turn_id: str = "", **_: Any) -> None:
+    try:
+        thread = _usage_thread()
+        if not thread:
+            return
+        session = session_id or task_id
+        with _runs_lock:
+            runs = _runs.get(thread, {})
+            if session in runs and runs[session] in (turn_id, ""):
+                runs.pop(session)
+            left = bool(runs)
+            if not runs:
+                _runs.pop(thread, None)
+        adapter = _adapter_of(thread)
+        if not left and adapter is not None and thread in adapter._owed_end:
+            _on_loop(adapter, lambda: adapter._end_turn(thread))
+    except Exception:
+        logger.warning("[briefling] agent run end not tracked", exc_info=True)
 
 
 def take_acted(thread: str) -> bool:
@@ -691,6 +763,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=600)
         self._opened = asyncio.Event()
         self._turns: set = set()  # threads whose turn is running here (processing hooks)
+        self._owed_end: Dict[str, str] = {}  # thread -> message id: turn.ended due when its agent run ends
         self._spoke: set = set()  # threads with non-empty text posted since their turn started (waiting gate)
         self._stop_asked: Dict[str, str] = {}  # thread -> who asked the hub to stop its running turn
         self._stop_ids: set = set()  # message ids of the synthetic /stop events: the gateway's reply to them is dropped
@@ -1654,28 +1727,50 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         thread = getattr(event.source, "chat_id", None)
         if thread:
-            self._turns.add(thread)
-            self._spoke.discard(thread)
-            self._stop_asked.pop(thread, None)
-            take_acted(thread)  # tools of an earlier turn don't count
-            self._reset_progress(thread)
-            self._turn_since[thread] = int(time.time() * 1000)
-            await self._send_frame({"type": "turn.started", "thread": thread, "at": self._turn_at(thread)})
+            await self._start_turn(thread)
+
+    async def _start_turn(self, thread: str, owed: Optional[str] = None) -> None:
+        """``owed`` set: an agent run opened it (no processing hook), so the run's end closes it."""
+        if owed is not None:
+            if thread in self._turns:
+                return  # the processing hook opened it meanwhile
+            self._owed_end[thread] = owed
+        self._turns.add(thread)
+        self._spoke.discard(thread)
+        self._stop_asked.pop(thread, None)
+        take_acted(thread)  # tools of an earlier turn don't count
+        self._reset_progress(thread)
+        self._turn_since[thread] = int(time.time() * 1000)
+        await self._send_frame({"type": "turn.started", "thread": thread, "at": self._turn_at(thread)})
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         thread = getattr(event.source, "chat_id", None)
-        if thread:
-            self._turns.discard(thread)
-            self._spoke.discard(thread)
-            self._reset_progress(thread)
-            usage = take_usage(thread)
-            acted = take_acted(thread)
-            stop = {"stopped": True, "acted": acted} if self._stop_asked.pop(thread, None) else {}
-            sent = await self._send_frame({"type": "turn.ended", "thread": thread, "at": self._turn_at(thread),
-                                           **({"usage": usage} if usage else {}), **stop})
-            if usage and not sent:
-                give_back_usage(thread, usage)
-            self._flow_turn_ended(thread, str(getattr(event, "message_id", "") or ""), usage if sent else None)
+        if not thread:
+            return
+        msg_id = str(getattr(event, "message_id", "") or "")
+        if run_active(thread):
+            self._owed_end[thread] = msg_id  # a message steered into a running run: the turn ends with the run
+            return
+        self._owed_end.pop(thread, None)
+        await self._end_turn(thread, msg_id)
+
+    async def _end_turn(self, thread: str, msg_id: Optional[str] = None) -> None:
+        """``msg_id`` None: the end owed by an agent run (``_owed_end``), sent once."""
+        if msg_id is None:
+            if thread not in self._owed_end:
+                return
+            msg_id = self._owed_end.pop(thread)
+        self._turns.discard(thread)
+        self._spoke.discard(thread)
+        self._reset_progress(thread)
+        usage = take_usage(thread)
+        acted = take_acted(thread)
+        stop = {"stopped": True, "acted": acted} if self._stop_asked.pop(thread, None) else {}
+        sent = await self._send_frame({"type": "turn.ended", "thread": thread, "at": self._turn_at(thread),
+                                       **({"usage": usage} if usage else {}), **stop})
+        if usage and not sent:
+            give_back_usage(thread, usage)
+        self._flow_turn_ended(thread, msg_id, usage if sent else None)
 
     # -- background work (sub-agents, notified processes): thread.background ----------------------
 
@@ -1702,7 +1797,28 @@ class BrieflingAdapter(BasePlatformAdapter):
             if await self._send_frame({"type": "thread.background", "thread": thread, "tasks": tasks}):
                 self._bg.sent(thread, tasks, now)
                 sent += 1
+        await self._close_orphan_turns(prefix)
         return sent
+
+    async def _close_orphan_turns(self, prefix: str) -> None:
+        """A turn owed by an agent run whose post_llm_call never came (Hermes returns early on a failed API retry
+        loop, a preflight gate...): closed once the gateway runs no agent for that thread any more."""
+        if not self._owed_end:
+            return
+        runner = getattr(self, "gateway_runner", None)
+        snapshot = getattr(runner, "_snapshot_running_agents", None)
+        if not callable(snapshot):
+            return  # no way to know: the turn stays open rather than closing under a running agent
+        try:
+            running = {background.thread_of(k, prefix) for k in snapshot()}
+        except Exception:
+            logger.debug("[%s] running agents unreadable", self.name, exc_info=True)
+            return
+        for thread in [t for t in self._owed_end if t not in running]:
+            with _runs_lock:
+                _runs.pop(thread, None)
+            logger.info("[%s] turn of %s closed: no agent runs there any more", self.name, thread)
+            await self._end_turn(thread)
 
     # -- flow ------------------------------------------------------------------
 
@@ -2830,7 +2946,8 @@ def register(ctx) -> None:
         ctx.register_hook("post_api_request", on_post_api_request)
         ctx.register_hook("post_auxiliary_call", on_post_auxiliary_call)
         ctx.register_hook("pre_tool_call", on_pre_tool_call)  # turn.ended.acted after a stop
-        ctx.register_hook("pre_llm_call", on_pre_llm_call)  # the space's project mounted in the session's sandbox
+        ctx.register_hook("pre_llm_call", on_pre_llm_call)  # project mount + turn opened for a run with no hook
+        ctx.register_hook("post_llm_call", on_post_llm_call)  # ... and closed when that run ends
         try:  # secrets masked in tool results before the model sees them; an older Hermes may not know the hook
             ctx.register_hook("transform_tool_result", vault.transform_tool_result)
         except Exception as e:
