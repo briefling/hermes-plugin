@@ -194,6 +194,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     ABOUT_SCHEMA,
     OUTCOME_SCHEMA,
     clean_summary,
+    clean_thread_tags,
     RESOURCE_PARAMS,
     ACQUIRE_SCHEMA,
     RELEASE_SCHEMA,
@@ -225,7 +226,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.59"
+VERSION = "0.3.60"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1388,10 +1389,10 @@ class BrieflingAdapter(BasePlatformAdapter):
         keep = ("id", "version", "name", "description", "emoji", "agent", "instruction", "fields", "leadsOnly")
         return {"ok": True, "applets": [{k: x[k] for k in keep if k in x} for x in r.get("applets") or []]}
 
-    async def topic_title(self, thread: str, title: str) -> Dict[str, Any]:
-        """Title a new Lounge topic (``thread`` = the topic, or the hidden conversation briefling opened for it)."""
+    async def topic_title(self, thread: str, title: str, tags: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Title a new Lounge topic (``thread`` = the topic, or the hidden conversation briefling opened for it), with its tags."""
         try:
-            await self._request({"type": "topic.title", "thread": thread, "title": title})
+            await self._request({"type": "topic.title", "thread": thread, "title": title, **({"tags": tags} if tags else {})})
         except HubRefused as e:
             return {"ok": False, "error": e.code, "detail": TITLE_ERRORS.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
@@ -1410,7 +1411,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         return thread in self._spoke
 
     async def turn_outcome(self, thread: str, outcome: str, action: str = "",
-                           summary: Optional[Dict[str, Any]] = None, resume: bool = False) -> Dict[str, Any]:
+                           summary: Optional[Dict[str, Any]] = None, resume: bool = False,
+                           tags: Optional[List[str]] = None) -> Dict[str, Any]:
         """Tell the hub how this turn ends (done, or waiting for a human action), with the thread's summary if given.
         The hub applies the gates."""
         if outcome == "waiting" and not await self._has_spoken(thread):
@@ -1422,6 +1424,8 @@ class BrieflingAdapter(BasePlatformAdapter):
                 frame["resume"] = True
         if summary:
             frame["summary"] = summary
+        if tags:
+            frame["tags"] = tags
         try:
             await self._request(frame)
         except HubRefused as e:
@@ -2160,7 +2164,10 @@ def topic_title_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error("title is required: one short line.")
     if len(title) > TOPIC_HEADING_MAX:
         return tool_error(f"title too long ({len(title)} chars, max {TOPIC_HEADING_MAX}): shorten it.")
-    return _on_adapter("topic_title", thread, lambda a: a.topic_title(thread, title))
+    tags, err = clean_thread_tags(args.get("tags"))
+    if err:
+        return tool_error(err)
+    return _on_adapter("topic_title", thread, lambda a: a.topic_title(thread, title, tags))
 
 
 def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2183,7 +2190,10 @@ def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
     summary, err = clean_summary(args.get("summary"))
     if err:
         return tool_error(err)
-    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary, resume is True))
+    tags, err = clean_thread_tags(args.get("tags"))
+    if err:
+        return tool_error(err)
+    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary, resume is True, tags))
 
 
 def _resource_args(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:

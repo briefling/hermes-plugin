@@ -19,6 +19,8 @@ SUMMARY_ITEMS_MAX = 8
 SUMMARY_ITEM_MAX = 300
 SUMMARY_WHO_MAX = 60
 SUMMARY_WAITING_MAX = 120
+THREAD_TAGS_MAX = 2  # protocol/tags.ts THREAD_TAGS_MAX (tags of a topic or thread)
+TAG_VOCAB_MAX = 60  # protocol/tags.ts TAG_VOCAB_MAX
 
 
 NO_TEXT = ("Nothing was posted in this thread during this turn: the human would see only the banner. Write your "
@@ -276,12 +278,17 @@ def build_plan(args: Dict[str, Any]) -> "tuple[Dict[str, Any] | None, str | None
     return frame, None
 
 
+UNKNOWN_TAG = ("A tag is not one of this space's memory tags: nothing was recorded. Call it again with tags taken only "
+               "from the list in the message context, or without tags if none fits.")
+
+
 OUTCOME_ERRORS = {
     "not_in_charge": "You are a guest in this thread (called by a mention): only its agent in charge does that here.",
     "not_thread": "This is a Lounge topic: no turn outcome here (a topic never waits on anyone).",
     "no_turn": "Only during a turn triggered by a trusted human in this thread.",
     "forbidden": "Not allowed for this instance.",
-    "bad_frame": "Invalid outcome (done | waiting), action (1-200 chars, required for waiting) or summary.",
+    "bad_frame": "Invalid outcome (done | waiting), action (1-200 chars, required for waiting), summary or tags (at most 2).",
+    "unknown_tag": UNKNOWN_TAG,
     "parked": "You are waiting for a resource: end your turn without turn_outcome; the hub resumes this thread.",
 }
 
@@ -314,7 +321,8 @@ TITLE_ERRORS = {
     "not_trusted": "This topic was not opened by a lead of the space: you do not title it.",
     "already_titled": "This topic already has a title: nothing to do.",
     "forbidden": "Not allowed for this instance.",
-    "bad_frame": f"Invalid title: one line of plain text, at most {TOPIC_HEADING_MAX} characters.",
+    "bad_frame": f"Invalid title (one line of plain text, at most {TOPIC_HEADING_MAX} characters) or tags (at most 2).",
+    "unknown_tag": UNKNOWN_TAG,
 }
 
 
@@ -685,6 +693,7 @@ def with_context(context: Dict[str, Any], text: str, mounted: bool = False) -> s
     if context.get("kind") == "topic":
         head += spawned_context(context.get("spawned"))
     head += deleted_context(context.get("deleted"))
+    head += tags_context(context)
     if context.get("name_topic") is True:
         head += (f"[This new topic has no title yet: call topic_title once with a short title (max {TOPIC_HEADING_MAX} "
                  "characters, plain text, in the message's language) drawn from the message addressed to you, then "
@@ -880,6 +889,31 @@ ABOUT_SCHEMA = {
 }
 
 
+TAGS_PARAM = {"type": "array", "items": {"type": "string"}, "maxItems": THREAD_TAGS_MAX, "description": (
+    "Only when the message context lists tags to pick from (the conversation has none yet): 1 or 2 of those tags, "
+    "saying what the conversation is about (e.g. ['ui', 'css']). Any other tag refuses the call. None fits: omit it.")}
+
+
+def clean_thread_tags(raw: Any):
+    """turn_outcome / topic_title's optional tags: (list or None when absent, error or None). The hub maps and checks them."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, list) or len(raw) > THREAD_TAGS_MAX or not all(isinstance(t, str) and 0 < len(t.strip()) <= 64 for t in raw):
+        return None, f"tags must be a list of at most {THREAD_TAGS_MAX} short tags taken from the message context."
+    return [t.strip() for t in raw], None
+
+
+def tags_context(context: Dict[str, Any]) -> str:
+    """`context.tag_vocab`: the conversation has no tags yet; the space's memory tags (slugs only) to pick 1-2 from."""
+    raw = context.get("tag_vocab")
+    vocab = [t for t in (raw if isinstance(raw, list) else [])[:TAG_VOCAB_MAX] if isinstance(t, str) and MEMORY_TAG_RE.fullmatch(t)]
+    if not vocab:
+        return ""
+    tool = "topic_title" if context.get("kind") == "topic" else "turn_outcome"
+    return (f"[This conversation has no tags yet: when you call {tool}, pass in `tags` 1 or 2 tags saying what it is "
+            f"about, taken only from this space's memory tags (none fits: no tags): {', '.join(vocab)}.]\n")
+
+
 TOPIC_TITLE_SCHEMA = {
     "name": "topic_title",
     "description": (
@@ -894,6 +928,7 @@ TOPIC_TITLE_SCHEMA = {
             "title": {"type": "string", "description": (
                 f"At most {TOPIC_HEADING_MAX} characters, one line, in the language of the message "
                 "(e.g. 'Badge: the 6 is misaligned', 'Publier le catalogue comme index ?').")},
+            "tags": TAGS_PARAM,
         },
         "required": ["title"],
     },
@@ -949,6 +984,7 @@ OUTCOME_SCHEMA = {
                 },
                 "required": ["status"],
             },
+            "tags": TAGS_PARAM,
         },
         "required": ["outcome"],
     },
