@@ -11,8 +11,8 @@ own Playwright script instead (from ``terminal`` or ``execute_code``) never goes
    newer than the tool call and the image changed, and hands it to the existing ``browser.frame`` path (same rate,
    watchers pause and end frame as browserthumb.py).
 
-Sandboxed backends only: on the local backend the « sandbox » is the host, and the plugin never writes into the
-host's Python. Best effort everywhere: a failure costs a debug line, never the agent's call.
+Isolated backends only (``SANDBOXES``): on the local or SSH backend the « sandbox » is a real host, and the plugin
+never writes into a host's Python. Best effort everywhere: a failure costs a debug line, never the agent's call.
 """
 from __future__ import annotations
 
@@ -65,8 +65,15 @@ def parse(out: str) -> Optional[tuple]:
         return None
 
 
+# Backends whose commands run in an isolated container or remote VM (Hermes' tools/environments). Whitelist, not
+# blacklist: local and SSH run on a real host, whose Python the plugin must never write into, and an unknown backend
+# is refused until it is listed here.
+SANDBOXES = frozenset({"DockerEnvironment", "ModalEnvironment", "ManagedModalEnvironment", "DaytonaEnvironment",
+                       "VercelSandboxEnvironment"})
+
+
 def sandboxed(env: Any) -> bool:
-    return env is not None and "local" not in type(env).__name__.lower()
+    return env is not None and type(env).__name__ in SANDBOXES
 
 
 class Poller:
