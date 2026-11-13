@@ -232,7 +232,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.65"
+VERSION = "0.3.66"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -515,20 +515,33 @@ _pw_installed: set = set()
 _pw_pollers: Dict[str, "pwthumb.Poller"] = {}
 
 
-def _pw_env():
-    """The sandbox the agent's terminal runs in, resolved in the turn's context (never a lookup outside a turn)."""
-    from tools.bot_desktop import placement  # private Hermes API: no thumbnail when it moves
-    return placement.terminal_environment(create=False)
+_pw_warned: set = set()
 
 
-def _pw_start(tool_name: str, tool_call_id: str) -> None:
+def _pw_env(task_id: str):
+    """The sandbox the agent's terminal runs in, resolved in the turn's context (never a lookup outside a turn).
+
+    Same key as the terminal tool itself: ``_resolve_container_task_id(task_id)``. The tool call's ``task_id`` is
+    required: with per-session containers the key is derived from it, and a lookup without it (as
+    ``bot_desktop.placement.terminal_environment`` does) finds nothing. PRIVATE Hermes API: no thumbnail when it moves.
+    Never creates an environment: before the first terminal call of a sandbox there is simply nothing yet."""
+    from tools import terminal_tool as tt
+    with tt._env_lock:
+        env = tt._lookup_active_env(tt._resolve_container_task_id(task_id or None), task_id or None)
+    if env is None and task_id not in _pw_warned:
+        _pw_warned.add(task_id)
+        logger.info("[briefling] playwright thumbnail: no terminal environment yet for this call")
+    return env
+
+
+def _pw_start(tool_name: str, tool_call_id: str, task_id: str = "") -> None:
     if tool_name not in pwthumb.TOOLS or not tool_call_id:
         return
     thread = _usage_thread()
     adapter = _adapter_of(thread)
     if adapter is None:
         return
-    poller = pwthumb.Poller(_pw_env, lambda img: _send_thumb(thread, adapter, img), int(time.time() * 1000),
+    poller = pwthumb.Poller(lambda: _pw_env(task_id), lambda img: _send_thumb(thread, adapter, img), int(time.time() * 1000),
                             _pw_installed, _pw_lock, ready=lambda: _thumbs.due(thread))
     with _pw_lock:
         _pw_pollers[tool_call_id] = poller
@@ -561,11 +574,11 @@ def on_post_tool_call(tool_name: str = "", task_id: str = "", tool_call_id: str 
         logger.debug("[briefling] browser thumbnail not sent", exc_info=True)
 
 
-def on_pre_tool_call(tool_name: str = "", tool_call_id: str = "", **_: Any) -> None:
+def on_pre_tool_call(tool_name: str = "", tool_call_id: str = "", task_id: str = "", **_: Any) -> None:
     try:
-        _pw_start(tool_name, tool_call_id)
+        _pw_start(tool_name, tool_call_id, task_id)
     except Exception:
-        logger.debug("[briefling] playwright thumbnail poller not started", exc_info=True)
+        logger.warning("[briefling] playwright thumbnail poller not started", exc_info=True)
     try:
         thread = _usage_thread()
         if thread:
