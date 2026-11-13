@@ -113,6 +113,7 @@ from . import vault
 from . import background
 from . import preview as pv
 from . import browserthumb as bthumb
+from . import pwthumb
 from . import projects as proj
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
@@ -231,7 +232,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.64"
+VERSION = "0.3.65"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -501,9 +502,52 @@ _acted: set = set()  # threads with at least one tool call since their turn star
 _thumbs = bthumb.Thumbs()
 
 
-def on_post_tool_call(tool_name: str = "", task_id: str = "", **_: Any) -> None:
+def _send_thumb(thread: str, adapter: "BrieflingAdapter", image: bytes) -> None:
+    out = bthumb.to_jpeg(image)
+    if out and _thumbs.changed(thread, out[0]):
+        f = bthumb.frame(thread, *out)
+        _on_loop(adapter, lambda: adapter._send_frame(f), wait=2.0)
+
+
+# Playwright scripts run from the terminal (pwthumb.py): one poller per running terminal-like call, by tool_call_id.
+_pw_lock = threading.Lock()
+_pw_installed: set = set()
+_pw_pollers: Dict[str, "pwthumb.Poller"] = {}
+
+
+def _pw_env():
+    """The sandbox the agent's terminal runs in, resolved in the turn's context (never a lookup outside a turn)."""
+    from tools.bot_desktop import placement  # private Hermes API: no thumbnail when it moves
+    return placement.terminal_environment(create=False)
+
+
+def _pw_start(tool_name: str, tool_call_id: str) -> None:
+    if tool_name not in pwthumb.TOOLS or not tool_call_id:
+        return
+    thread = _usage_thread()
+    adapter = _adapter_of(thread)
+    if adapter is None:
+        return
+    poller = pwthumb.Poller(_pw_env, lambda img: _send_thumb(thread, adapter, img), int(time.time() * 1000),
+                            _pw_installed, _pw_lock, ready=lambda: _thumbs.due(thread))
+    with _pw_lock:
+        _pw_pollers[tool_call_id] = poller
+    poller.env()  # set the sandbox up BEFORE the command runs, else the first script of a sandbox is missed
+    ctx = contextvars.copy_context()  # the turn's context: profile scope and container key
+    threading.Thread(target=ctx.run, args=(poller.run,), name="briefling-pwthumb", daemon=True).start()
+
+
+def _pw_stop(tool_call_id: str) -> None:
+    with _pw_lock:
+        poller = _pw_pollers.pop(tool_call_id, None) if tool_call_id else None
+    if poller is not None:
+        poller.stop()
+
+
+def on_post_tool_call(tool_name: str = "", task_id: str = "", tool_call_id: str = "", **_: Any) -> None:
     """After a browser tool of a briefling turn: a capture of the page to the tabs watching it (rate, change, pause)."""
     try:
+        _pw_stop(tool_call_id)
         if not bthumb.is_browser_tool(tool_name):
             return
         thread = _usage_thread()
@@ -511,15 +555,17 @@ def on_post_tool_call(tool_name: str = "", task_id: str = "", **_: Any) -> None:
         if adapter is None or not task_id or not _thumbs.due(thread):
             return
         png = bthumb.capture(task_id)
-        out = bthumb.to_jpeg(png) if png else None
-        if out and _thumbs.changed(thread, out[0]):
-            f = bthumb.frame(thread, *out)
-            _on_loop(adapter, lambda: adapter._send_frame(f), wait=2.0)
+        if png:
+            _send_thumb(thread, adapter, png)
     except Exception:
         logger.debug("[briefling] browser thumbnail not sent", exc_info=True)
 
 
-def on_pre_tool_call(**_: Any) -> None:
+def on_pre_tool_call(tool_name: str = "", tool_call_id: str = "", **_: Any) -> None:
+    try:
+        _pw_start(tool_name, tool_call_id)
+    except Exception:
+        logger.debug("[briefling] playwright thumbnail poller not started", exc_info=True)
     try:
         thread = _usage_thread()
         if thread:
