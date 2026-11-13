@@ -232,7 +232,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.66"
+VERSION = "0.3.67"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -515,23 +515,21 @@ _pw_installed: set = set()
 _pw_pollers: Dict[str, "pwthumb.Poller"] = {}
 
 
-_pw_warned: set = set()
-
-
 def _pw_env(task_id: str):
-    """The sandbox the agent's terminal runs in, resolved in the turn's context (never a lookup outside a turn).
+    """The sandbox the agent's terminal runs in, resolved inside the turn (pre_tool_call), never outside one.
 
-    Same key as the terminal tool itself: ``_resolve_container_task_id(task_id)``. The tool call's ``task_id`` is
-    required: with per-session containers the key is derived from it, and a lookup without it (as
-    ``bot_desktop.placement.terminal_environment`` does) finds nothing. PRIVATE Hermes API: no thumbnail when it moves.
-    Never creates an environment: before the first terminal call of a sandbox there is simply nothing yet."""
-    from tools import terminal_tool as tt
-    with tt._env_lock:
-        env = tt._lookup_active_env(tt._resolve_container_task_id(task_id or None), task_id or None)
-    if env is None and task_id not in _pw_warned:
-        _pw_warned.add(task_id)
-        logger.info("[briefling] playwright thumbnail: no terminal environment yet for this call")
-    return env
+    Same lookup as the preview (``preview.task_env``, proven in prod): ``terminal_tool_lifecycle.get_active_env``,
+    else ``ensure_task_env``, which brings it up with the terminal tool's own machinery (the terminal call about to
+    run would do it anyway). Re-deriving Hermes' container keys here found nothing live (0.3.65, 0.3.66). Never the
+    host: no environment, or a local backend, means no thumbnail."""
+    from . import preview
+    if preview._backend_is_local():
+        return None
+    try:
+        return preview.task_env(task_id or None)
+    except preview.PreviewError as e:
+        logger.info("[briefling] playwright thumbnail: no terminal environment (%s)", e)
+        return None
 
 
 def _pw_start(tool_name: str, tool_call_id: str, task_id: str = "") -> None:
