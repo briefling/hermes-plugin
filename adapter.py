@@ -112,6 +112,7 @@ from .flowswitch import SwitchError, parse_link
 from . import vault
 from . import background
 from . import preview as pv
+from . import browserthumb as bthumb
 from . import projects as proj
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
@@ -230,7 +231,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.63"
+VERSION = "0.3.64"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -494,6 +495,28 @@ def on_post_auxiliary_call(**kw: Any) -> None:
 # whether the agent had already acted, since what a tool did stays done. Observer only: returns nothing, never raises.
 _acted_lock = threading.Lock()
 _acted: set = set()  # threads with at least one tool call since their turn started
+
+
+# -- live thumbnail of the agent's browser (browserthumb.py) --------------------------------------------------------
+_thumbs = bthumb.Thumbs()
+
+
+def on_post_tool_call(tool_name: str = "", task_id: str = "", **_: Any) -> None:
+    """After a browser tool of a briefling turn: a capture of the page to the tabs watching it (rate, change, pause)."""
+    try:
+        if not bthumb.is_browser_tool(tool_name):
+            return
+        thread = _usage_thread()
+        adapter = _adapter_of(thread)
+        if adapter is None or not task_id or not _thumbs.due(thread):
+            return
+        png = bthumb.capture(task_id)
+        out = bthumb.to_jpeg(png) if png else None
+        if out and _thumbs.changed(thread, out[0]):
+            f = bthumb.frame(thread, *out)
+            _on_loop(adapter, lambda: adapter._send_frame(f), wait=2.0)
+    except Exception:
+        logger.debug("[briefling] browser thumbnail not sent", exc_info=True)
 
 
 def on_pre_tool_call(**_: Any) -> None:
@@ -970,6 +993,9 @@ class BrieflingAdapter(BasePlatformAdapter):
             await self._on_secret(frame)
         elif kind == "turn.stop":
             self._on_stop(frame)
+        elif kind == "browser.watchers":
+            if isinstance(frame.get("thread"), str) and isinstance(frame.get("n"), int):
+                _thumbs.watchers(frame["thread"], frame["n"])
         elif kind == "flow.config":
             await self._on_flow_config(frame)
         elif kind == "flow.pause":
@@ -1787,6 +1813,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._turns.discard(thread)
         self._spoke.discard(thread)
         self._reset_progress(thread)
+        if _thumbs.end(thread):  # the tabs drop the browser thumbnail at once
+            await self._send_frame(bthumb.end_frame(thread))
         usage = take_usage(thread)
         acted = take_acted(thread)
         stop = {"stopped": True, "acted": acted} if self._stop_asked.pop(thread, None) else {}
@@ -3022,6 +3050,7 @@ def register(ctx) -> None:
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("post_api_request", on_post_api_request)
         ctx.register_hook("post_auxiliary_call", on_post_auxiliary_call)
+        ctx.register_hook("post_tool_call", on_post_tool_call)  # browser thumbnail (browserthumb.py)
         ctx.register_hook("pre_tool_call", on_pre_tool_call)  # turn.ended.acted after a stop
         ctx.register_hook("pre_llm_call", on_pre_llm_call)  # project mount + turn opened for a run with no hook
         ctx.register_hook("post_llm_call", on_post_llm_call)  # ... and closed when that run ends
