@@ -232,7 +232,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.67"
+VERSION = "0.3.68"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1008,9 +1008,12 @@ class BrieflingAdapter(BasePlatformAdapter):
             return False
         if vault.has_any() and frame.get("type") != "secret.received":
             frame = vault.redact_obj(frame)  # safety net: a value the agent echoed never reaches the hub
+        data = json.dumps({"v": PROTOCOL_VERSION, **frame})
+        if frame.get("type") == "browser.frame" and len(data.encode()) > bthumb.FRAME_MAX:
+            return False  # API Gateway would close the connection (1009): a thumbnail is never worth a disconnect
         async with self._send_lock:
             try:
-                await ws.send_str(json.dumps({"v": PROTOCOL_VERSION, **frame}))
+                await ws.send_str(data)
                 return True
             except Exception as e:
                 logger.warning("[%s] send to hub failed: %s", self.name, type(e).__name__)

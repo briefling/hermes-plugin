@@ -25,9 +25,15 @@ logger = logging.getLogger(__name__)
 
 MIN_S = 1.0           # protocol/browser.ts BROWSER_MIN_MS
 IDLE_S = 10.0         # protocol/browser.ts BROWSER_IDLE_MS
-JPEG_MAX = 90_000     # protocol/browser.ts BROWSER_JPEG_MAX (base64 length)
+# API Gateway closes a WebSocket with 1009 on any frame over 32 KB (« WebSocket frame size » quota; only a message split
+# into several frames may reach 128 KB, and aiohttp sends one frame per message). A 45 KB thumbnail of a busy page
+# disconnected the agent from the hub, so the whole JSON frame stays under 32 KB: base64 <= 31 000 chars.
+# protocol/browser.ts BROWSER_JPEG_MAX (90 000) stays the hub's own bound.
+JPEG_MAX = 31_000
+FRAME_MAX = 32_000    # bytes of the serialized browser.frame (adapter._send_frame drops a larger one)
 WIDTH = 640           # thumbnail width: ~20 KB at quality 55 for a usual page
 QUALITIES = (55, 40, 25)
+SMALL = (480, 25)     # last try for a busy page: narrower, low quality
 # Tools that only read the page or run in another context: no capture after them.
 SKIP = frozenset({"browser_console", "browser_get_images", "browser_vault", "browser_dialog"})
 
@@ -48,12 +54,13 @@ def to_jpeg(png: bytes) -> Optional[tuple]:
         if im.width > WIDTH:
             im = im.resize((WIDTH, max(1, round(im.height * WIDTH / im.width))), Image.LANCZOS)
         im = im.crop((0, 0, im.width, min(im.height, round(im.width * 1.25))))  # the top of a long page only
-        for q in QUALITIES:
+        small = im.resize((SMALL[0], max(1, round(im.height * SMALL[0] / im.width))), Image.LANCZOS) if im.width > SMALL[0] else im
+        for img, q in [(im, q) for q in QUALITIES] + [(small, SMALL[1])]:
             buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=q, optimize=True)
+            img.save(buf, "JPEG", quality=q, optimize=True)
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
             if len(b64) <= JPEG_MAX:
-                return b64, im.width, im.height
+                return b64, img.width, img.height
     except Exception:
         logger.debug("[briefling] browser thumbnail: bad image", exc_info=True)
     return None
