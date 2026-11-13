@@ -230,7 +230,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.62"
+VERSION = "0.3.63"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -2925,6 +2925,8 @@ def register(ctx) -> None:
             "turn_outcome tool: 'done', or 'waiting' + the action you need from the human. "
             "In a topic or a thread, points the human must decide between options go through the ask_choices card "
             "(one card, choices per point, your recommendation first), not questions written in text. "
+            "When you wait for a human's validation or decision, @mention that person by name in your message "
+            "(the lead who asked you): briefling notifies the people an agent mentions, even in a space they muted. "
             "When writing in French, use the app's French words: thread = chantier (never 'fil'), "
             "topic = sujet, Lounge = Comptoir; a propose_thread card is 'je propose un chantier'."
         ),
