@@ -232,7 +232,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.70"
+VERSION = "0.3.71"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1313,10 +1313,13 @@ class BrieflingAdapter(BasePlatformAdapter):
         finally:
             self._waiting.pop(cid, None)
 
-    async def propose_thread(self, thread: str, title: str, why: str = "", brief: str = "", space: str = "", context: str = "") -> Dict[str, Any]:
+    async def propose_thread(self, thread: str, title: str, why: str = "", brief: str = "", space: str = "", context: str = "",
+                             as_topic: bool = False) -> Dict[str, Any]:
         """Ask the hub to show the "Make it a thread?" card in this topic or thread (`space`: a topic in another
-        space's Lounge instead). The hub decides (gates)."""
+        space's Lounge instead; `as_topic`: "Make it a topic?", a new topic of this space's Lounge). The hub decides (gates)."""
         frame: Dict[str, Any] = {"type": "thread.propose", "thread": thread, "title": title.strip()[:120]}
+        if as_topic:
+            frame["topic"] = True
         if space.strip():
             frame["space"] = space.strip()
         if why.strip():
@@ -2151,7 +2154,8 @@ def propose_thread_tool(args: Dict[str, Any], **_: Any) -> str:
     if cerr:
         return tool_error(cerr)
     space = str(args.get("space") or "").strip()
-    return _on_adapter("propose_thread", thread, lambda a: a.propose_thread(thread, title, str(args.get("why") or ""), brief, space, context))
+    as_topic = args.get("as_topic") is True
+    return _on_adapter("propose_thread", thread, lambda a: a.propose_thread(thread, title, str(args.get("why") or ""), brief, space, context, as_topic))
 
 
 def propose_issue_tool(args: Dict[str, Any], **_: Any) -> str:
