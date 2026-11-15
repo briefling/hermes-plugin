@@ -343,8 +343,8 @@ def totp_code(thread: str, name: str, now: Optional[float] = None) -> Dict[str, 
 SECRET_TOTP_SCHEMA = {
     "name": "secret_totp",
     "description": (
-        "Current one-time code (TOTP) of an MFA seed a human shared with you via briefling's Secret button, by its "
-        "name. Returns only the code and how long it stays valid, never the seed."
+        "Get the current one-time code of a shared MFA seed. The TOTP of a seed a human shared with you via briefling's Secret "
+        "button, by its name. Returns only the code and how long it stays valid, never the seed."
     ),
     "parameters": {
         "type": "object",
