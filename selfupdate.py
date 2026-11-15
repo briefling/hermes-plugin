@@ -252,6 +252,18 @@ def restarted_from(install: Install, current: str) -> Optional[str]:
     return None
 
 
+def blocked(install: Install, on: bool, current: str) -> Optional[str]:
+    """Why this plugin will not install new releases by itself, reported at subscribe (the hub shows the space's
+    leads a banner while it is behind): ``off``, ``pinned``, ``manual`` (no git install) or ``failed``; None = it will."""
+    if not on:
+        return "off"
+    why = install.refusal()
+    if why:
+        return "pinned" if why.startswith("pinned") else "manual"
+    state = install.state()  # a failure of a release older than the running code (updated by hand since) is over
+    return "failed" if state.get("status") == "failed" and is_newer(str(state.get("version")), current) else None
+
+
 def idle(runner: Any) -> Optional[bool]:
     """Whether the gateway runs no work at all (every profile, cron, API runs); None = cannot tell."""
     count = getattr(runner, "_active_work_count", None) or getattr(runner, "_running_agent_count", None)

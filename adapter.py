@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.73"
+VERSION = "0.3.74"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -881,6 +881,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._auto_update = selfupdate.enabled(_setting(extra, "auto_update", "BRIEFLING_AUTO_UPDATE") or "1")
         self._update_task: Optional[asyncio.Task] = None
         self._updated_from: Optional[str] = None  # this process is the restart of an auto-update from that version
+        self._update_block: Optional[str] = None  # selfupdate.blocked(): why it will not self-update (subscribe)
 
     # -- connection ----------------------------------------------------------
 
@@ -894,6 +895,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             frame["plugin"]["voice"] = True
         if self._updated_from:  # the hub posts one notice (it compares with the version it last recorded)
             frame["plugin"]["updated_from"] = self._updated_from
+        if self._update_block:
+            frame["plugin"]["update"] = self._update_block
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
@@ -911,11 +914,13 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._loop = asyncio.get_running_loop()
         _ADAPTERS.add(self)
         vault.purge_all()  # leftovers of a crash: their key died with that process
-        if self._auto_update and self._updated_from is None:
-            try:
-                self._updated_from = selfupdate.restarted_from(selfupdate.Install.here(), VERSION)
-            except OSError:
-                logger.debug("[%s] self-update state unreadable", self.name, exc_info=True)
+        try:
+            install = selfupdate.Install.here()
+            if self._auto_update and self._updated_from is None:
+                self._updated_from = selfupdate.restarted_from(install, VERSION)
+            self._update_block = selfupdate.blocked(install, self._auto_update, VERSION)
+        except OSError:
+            logger.debug("[%s] self-update state unreadable", self.name, exc_info=True)
         self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._run())
         if self._flow_spaces:
@@ -1948,6 +1953,8 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def _self_update(self, release: Dict[str, str]) -> None:
         loop = asyncio.get_running_loop()
         outcome = await loop.run_in_executor(None, selfupdate.apply, selfupdate.Install.here(), release, VERSION)
+        if outcome.status == "failed":
+            self._update_block = "failed"  # told to the hub at the next subscribe (reconnection: within ~2 h)
         if not outcome.restart:
             return
         await asyncio.sleep(selfupdate.SETTLE_S)  # the other profiles of this gateway get the same release
