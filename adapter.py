@@ -112,6 +112,7 @@ from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
 from .flowswitch import SwitchError, parse_link
 from . import vault
 from . import background
+from . import selfupdate
 from . import preview as pv
 from . import browserthumb as bthumb
 from . import pwthumb
@@ -235,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.72"
+VERSION = "0.3.73"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -876,6 +877,10 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._voice_dir = voice_dir if voice_dir and pv.voice_file_ok(voice_dir) else ""
         if voice_dir and not self._voice_dir:
             logger.warning("[briefling] BRIEFLING_VOICE ignored: not a plain path")
+        # Self-update (selfupdate.py): the release the hub announces at each `subscribed`; BRIEFLING_AUTO_UPDATE=0 = off.
+        self._auto_update = selfupdate.enabled(_setting(extra, "auto_update", "BRIEFLING_AUTO_UPDATE") or "1")
+        self._update_task: Optional[asyncio.Task] = None
+        self._updated_from: Optional[str] = None  # this process is the restart of an auto-update from that version
 
     # -- connection ----------------------------------------------------------
 
@@ -887,6 +892,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             frame["plugin"]["secret_key"] = vault.public_key(self._secret_key)
         if self._voice_dir:
             frame["plugin"]["voice"] = True
+        if self._updated_from:  # the hub posts one notice (it compares with the version it last recorded)
+            frame["plugin"]["updated_from"] = self._updated_from
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
@@ -904,6 +911,11 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._loop = asyncio.get_running_loop()
         _ADAPTERS.add(self)
         vault.purge_all()  # leftovers of a crash: their key died with that process
+        if self._auto_update and self._updated_from is None:
+            try:
+                self._updated_from = selfupdate.restarted_from(selfupdate.Install.here(), VERSION)
+            except OSError:
+                logger.debug("[%s] self-update state unreadable", self.name, exc_info=True)
         self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._run())
         if self._flow_spaces:
@@ -925,6 +937,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         if getattr(self, "_bg_task", None):
             self._bg_task.cancel()
             self._bg_task = None
+        if self._update_task:
+            self._update_task.cancel()
+            self._update_task = None
         if self._task:
             self._task.cancel()
             try:
@@ -1085,6 +1100,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
             for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
+            self._offer_update(frame.get("release"))
         elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
@@ -1919,6 +1935,35 @@ class BrieflingAdapter(BasePlatformAdapter):
                 sent += 1
         await self._close_orphan_turns(prefix)
         return sent
+
+    def _offer_update(self, release: Any) -> None:
+        """`subscribed.release`: a newer release starts the self-update (one at a time, this profile only)."""
+        rel = selfupdate.valid_release(release)
+        if not self._auto_update or rel is None or not selfupdate.is_newer(rel["version"], VERSION):
+            return
+        if self._update_task is not None and not self._update_task.done():
+            return
+        self._update_task = asyncio.create_task(self._self_update(rel))
+
+    async def _self_update(self, release: Dict[str, str]) -> None:
+        loop = asyncio.get_running_loop()
+        outcome = await loop.run_in_executor(None, selfupdate.apply, selfupdate.Install.here(), release, VERSION)
+        if not outcome.restart:
+            return
+        await asyncio.sleep(selfupdate.SETTLE_S)  # the other profiles of this gateway get the same release
+        while self._running:
+            runner = getattr(self, "gateway_runner", None)
+            free = selfupdate.idle(runner)
+            if free is None:
+                logger.warning("[%s] update %s installed, the gateway cannot be restarted from here: /restart it",
+                               self.name, release["version"])
+                return
+            if free:
+                started = selfupdate.request_restart(runner)
+                logger.info("[%s] update %s: gateway restart %s", self.name, release["version"],
+                            "requested" if started else "already under way")
+                return
+            await asyncio.sleep(selfupdate.IDLE_POLL_S)
 
     async def _close_orphan_turns(self, prefix: str) -> None:
         """A turn owed by an agent run whose post_llm_call never came (Hermes returns early on a failed API retry

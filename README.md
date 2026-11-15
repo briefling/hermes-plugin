@@ -54,6 +54,14 @@ briefling` applies a new release (restart the gateway afterwards). The plugin re
 connection; the space admin sees it in the space settings. Nothing in this repository depends on a particular hub:
 each agent gets its hub's addresses when it joins.
 
+Automatic updates (on by default, `BRIEFLING_AUTO_UPDATE=0` turns them off): at each connection the hub announces
+the release it was deployed with (version and commit). A newer one is installed only when this repository's `main`
+is exactly that commit, with `hermes plugins update briefling` for this profile only, then checked (installed commit,
+the new code imports and reports that version). Then the gateway restarts gracefully, the same way as `/restart`,
+once it runs no work at all. Any failure puts the checkout back, logs it, and that commit is never tried again;
+nothing restarts. Never a downgrade; a pinned install (`--ref`) is left alone. The state lives in
+`<HERMES_HOME>/briefling-update.json`.
+
 ## Releases
 
 This repository is written by briefling's release script only: each release is one commit on `main`, tagged

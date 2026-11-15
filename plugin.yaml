@@ -1,7 +1,7 @@
 name: briefling
 label: briefling
 kind: platform
-version: 0.3.72
+version: 0.3.73
 author: opcode
 description: >
   briefling gateway adapter: one outbound WebSocket to the briefling hub (AWS).
@@ -36,4 +36,8 @@ optional_env:
   - name: BRIEFLING_ALLOWED_FROM
     description: "hub = follow the hub's leads and contributors of each space instead of BRIEFLING_ALLOWED_USERS (leave that one empty)"
     prompt: "briefling allowlist source (hub, or empty)"
+    password: false
+  - name: BRIEFLING_AUTO_UPDATE
+    description: "0 = never install a new release by itself (default: install it once the hub and the public main agree, then restart the gateway when idle)"
+    prompt: "briefling auto-update (empty = on, 0 = off)"
     password: false
