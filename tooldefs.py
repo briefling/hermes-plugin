@@ -2034,6 +2034,7 @@ APPLET_KINDS = ("text", "textarea", "number", "date", "checkbox", "select", "mul
 APPLET_ACCEPTS = ("pdf", "image", "word", "sheet")
 # keys passed through as given (the hub checks each against its kind, protocol/applets.ts appletIn)
 APPLET_FIELD_KEYS = ("showIf", "placeholder", "unit", "min", "max", "of", "accept")
+APPLET_STEPS_MAX = 8
 APPLET_FIELD_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 APPLET_DESC_MAX = 200
 APPLET_EMOJI_MAX = 16
@@ -2050,7 +2051,8 @@ APPLET_ERRORS = {
                   "unit/placeholder only on text, number, list; min/max/integer only on number or a list of numbers (min <= max); "
                   "of only on list; accept only on file; showIf names an EARLIER field, one test (equals or in: options of that "
                   "select/multiselect or a text; filled: true/false for any kind); "
-                  f"{APPLET_FILE_FIELDS_MAX} file fields at most; description: one line of {APPLET_DESC_MAX} chars at most; emoji: "
+                  f"{APPLET_FILE_FIELDS_MAX} file fields at most; steps (optional): 2-{APPLET_STEPS_MAX}, each a title of "
+                  "1-60 chars and field ids, listing every field once in the order of fields; description: one line of {APPLET_DESC_MAX} chars at most; emoji: "
         "one emoji, nothing else."),
 }
 
@@ -2119,6 +2121,14 @@ APPLET_PROPOSE_SCHEMA = {
                     "required": ["id", "label", "kind"],
                 },
             },
+            "steps": {"type": "array", "description": (
+                f"Optional: a long form in 2-{APPLET_STEPS_MAX} steps (Back / Next, each step checked before the next, a summary "
+                "before Launch). Each step: a short title and the ids of its fields; together they list every field once, in "
+                "the order of `fields`. A step whose fields are all hidden (showIf) is skipped. Leave it out for a short form "
+                "(one page)."),
+                "items": {"type": "object", "properties": {"title": {"type": "string", "description": "Step title (max 60 chars), e.g. « Pivot »."},
+                                                           "fields": {"type": "array", "items": {"type": "string"}, "description": "Ids of its fields, in order."}},
+                          "required": ["title", "fields"]}},
             "id": {"type": "string", "description": "Only to update an existing applet: its id."},
             "why": {"type": "string", "description": "One sentence shown on the card: what it is for, or what changed."},
         },
@@ -2170,6 +2180,15 @@ def build_applet_propose(args: Dict[str, Any]) -> "tuple[Dict[str, Any] | None, 
     if sum(1 for f in out if f["kind"] == "file") > APPLET_FILE_FIELDS_MAX:
         return None, f"{APPLET_FILE_FIELDS_MAX} file fields at most."
     draft: Dict[str, Any] = {"name": name, "agent": agent, "instruction": instruction, "fields": out}
+    steps = args.get("steps")
+    if steps not in (None, []):
+        # passed through as given: the hub checks them (protocol/applets.ts stepsIn); only the common slip is named here
+        if not isinstance(steps, list) or not 2 <= len(steps) <= APPLET_STEPS_MAX:
+            return None, f"steps: 2-{APPLET_STEPS_MAX} steps, or leave it out for a one-page form."
+        cited = [i for s in steps if isinstance(s, dict) for i in (s.get("fields") or [])]
+        if cited != [f["id"] for f in out]:
+            return None, "steps: together they must list every field id once, in the order of fields."
+        draft["steps"] = steps
     desc = str(args.get("description") or "").strip()
     if desc:
         if len(desc) > APPLET_DESC_MAX or "\n" in desc:
