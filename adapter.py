@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.74"
+VERSION = "0.3.75"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1652,7 +1652,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             return dict(HUB_UNREACHABLE)
         skipped = [str(x) for x in (res.get("skipped") or [])][:MEMORY_MERGES_MAX]
         return {"ok": True, "added": res.get("added"), "skipped": skipped,
-                "detail": "Merges wait for a human in the Memory view." + (" Skipped: a tag not in use, already waiting, or merged away in the same call." if skipped else "")}
+                "detail": ("Applied: entries and conversations retagged." if res.get("applied") else "Merges wait for a human in the Memory view.")
+                + (" Skipped: a tag not in use, already waiting, merged away in the same call, or a kind tag (decision, pitfall)." if skipped else "")}
 
     async def memory_tag_threads(self, thread: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         """memory.threadtag: the memory agent tags untagged conversations (the hub checks thread, agent, compaction turn)."""
@@ -2585,10 +2586,12 @@ MEMORY_COMPACT_SCHEMA = {
 MEMORY_TAG_MERGE_SCHEMA = {
     "name": "memory_tag_merge",
     "description": (
-        "Propose to merge two tags naming one concept. Only when the hub asks you to compact the project memory: if two tags of the space name the same "
-        "concept (an English and a French word, a plural, a spelling variant: piege and pitfall, stacks and stack), "
-        "propose to merge them: from = the tag to drop, to = the English one (the most used when both are). A human "
-        "approves each merge; `from` then stays as an alias, still matched in messages. Never merge two different concepts."
+        "Revise the space's tag list. Only when the hub asks you to compact the project memory: the list stays under the "
+        "space's cap, in plain English words naming areas. Each change is {from, to}: a synonym, translation, plural or "
+        "spelling variant goes into the tag it duplicates (piege -> trap, stacks -> stack), and narrow tags that travel "
+        "together go into one broader area, `to` being an existing tag or a new plain word (ui, css, morphdom -> frontend). "
+        "A human approves the list (in agentAuto mode the hub applies it at once); every `from` then stays as an alias, "
+        "still matched in messages. Never fold different concepts into one catch-all tag."
     ),
     "parameters": {
         "type": "object",
@@ -2596,7 +2599,7 @@ MEMORY_TAG_MERGE_SCHEMA = {
             "merges": {"type": "array", "minItems": 1, "maxItems": MEMORY_MERGES_MAX, "items": {
                 "type": "object",
                 "properties": {"from": {"type": "string", "description": "Tag to merge away (it becomes an alias)."},
-                               "to": {"type": "string", "description": "Tag kept, in English."}},
+                               "to": {"type": "string", "description": "Tag kept: an existing one or a new plain English word."}},
                 "required": ["from", "to"]}},
         },
         "required": ["merges"],
