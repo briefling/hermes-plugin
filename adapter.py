@@ -236,12 +236,16 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.78"
+VERSION = "0.3.79"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
 MAX_STATUS = 200  # protocol/frames.ts MAX_STATUS
 MAX_ACTIVITY = 10  # protocol/frames.ts MAX_ACTIVITY (status.recent)
+# turn_outcome posted its text: the answer is out, the final reply of the turn is not shown (send() drops it).
+ANSWER_POSTED = ("Your text is posted in the thread. Do not restate or translate it: your final reply of this turn is not "
+                 "shown, end it with nothing more to say.")
+
 # turn_outcome waiting with nothing posted yet: how long to wait for text the gateway still has queued. Text written
 # in the same model step as the tool call goes through the gateway's stream consumer (a queue drained every
 # ~50 ms on the loop), so it can reach send/edit_message just after the tool starts.
@@ -866,6 +870,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._turns: set = set()  # threads whose turn is running here (processing hooks)
         self._owed_end: Dict[str, str] = {}  # thread -> message id: turn.ended due when its agent run ends
         self._spoke: set = set()  # threads with non-empty text posted since their turn started (waiting gate)
+        # Threads whose turn_outcome posted its text: the model's final reply that the gateway still sends is the same
+        # answer reworded (every answer showed twice), so send() drops it until the next turn starts.
+        self._answered: set = set()
         self._stop_asked: Dict[str, str] = {}  # thread -> who asked the hub to stop its running turn
         self._stop_ids: set = set()  # message ids of the synthetic /stop events: the gateway's reply to them is dropped
         self._stop_tasks: set = set()
@@ -1286,6 +1293,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         if reply_to and reply_to in self._stop_ids:  # the gateway's reply to our /stop: the hub's line says it
             self._stop_ids.discard(reply_to)
             return SendResult(success=True, message_id=None)
+        if chat_id in self._answered and not is_notice(content, metadata):
+            logger.info("[%s] final reply dropped in %s: turn_outcome already posted the answer", self.name, chat_id)
+            return SendResult(success=True, message_id=None)
         # A space instead of a conversation (cron `deliver=briefling:<space>`): the agent opens a Lounge topic on its own.
         if chat_id in self._hub_spaces and chat_id not in self._thread_space:
             return await self._open_topic(chat_id, content)
@@ -1547,6 +1557,7 @@ class BrieflingAdapter(BasePlatformAdapter):
                            tags: Optional[List[str]] = None, text: str = "") -> Dict[str, Any]:
         """Tell the hub how this turn ends (done, or waiting for a human action), with the thread's summary if given.
         ``text`` (the answer written in the same model step, not posted yet) is posted first. The hub applies the gates."""
+        self._answered.discard(thread)
         if text and not (await self.send(thread, text)).success:
             return dict(HUB_UNREACHABLE)
         if outcome == "waiting" and not await self._has_spoken(thread):
@@ -1566,9 +1577,13 @@ class BrieflingAdapter(BasePlatformAdapter):
             return {"ok": False, "error": e.code, "detail": OUTCOME_ERRORS.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
+        posted = ""
+        if text.strip():
+            self._answered.add(thread)
+            posted = " " + ANSWER_POSTED
         if outcome == "waiting":
-            return {"ok": True, "detail": "Shown in the thread: the human sees what you wait for."}
-        return {"ok": True, "detail": "Thread marked as finished.", "memory": MEMORY_NUDGE}
+            return {"ok": True, "detail": "Shown in the thread: the human sees what you wait for." + posted}
+        return {"ok": True, "detail": "Thread marked as finished." + posted, "memory": MEMORY_NUDGE}
 
     async def acquire_resource(self, thread: str, resource: str) -> Dict[str, Any]:
         """Take a shared resource of the space (answer `resource.result`: granted, or queued = thread parked)."""
@@ -1892,6 +1907,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._owed_end[thread] = owed
         self._turns.add(thread)
         self._spoke.discard(thread)
+        self._answered.discard(thread)
         self._stop_asked.pop(thread, None)
         take_acted(thread)  # tools of an earlier turn don't count
         self._reset_progress(thread)
