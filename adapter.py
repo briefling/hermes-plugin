@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.77"
+VERSION = "0.3.78"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -324,6 +324,18 @@ def approval_question(command: str, reason: str) -> str:
     while _u16(shown) > cut:  # astral characters weigh 2 UTF-16 units
         shown = shown[:-1]
     return head + shown + f"\n{fence}" + note.format(len(command) - len(shown)) + f"\nReason: {reason}"
+
+
+def cache_ttl() -> Optional[str]:
+    """Hermes' ``prompt_caching.cache_ttl`` as the agents of this gateway read it (``agent/agent_init.py``), reported at
+    subscribe so admins see an agent left on the 5-minute default (docs/setup.md step 8). Read only, never written.
+    A missing key is ``5m``, Hermes' default; the hub keeps only ``5m|1h|auto`` and drops anything else."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        value = (load_config_readonly().get("prompt_caching") or {}).get("cache_ttl", "5m")
+    except Exception:  # an unreadable config must never block the connection: report nothing
+        return None
+    return "5m" if value is None else str(value)[:16]
 
 
 def _setting(extra: Dict[str, Any], key: str, env: str) -> str:
@@ -897,6 +909,9 @@ class BrieflingAdapter(BasePlatformAdapter):
             frame["plugin"]["updated_from"] = self._updated_from
         if self._update_block:
             frame["plugin"]["update"] = self._update_block
+        ttl = cache_ttl()
+        if ttl is not None:
+            frame["plugin"]["cache_ttl"] = ttl
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
