@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.82"
+VERSION = "0.3.83"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -434,6 +434,10 @@ def price_call(model: Any, usage: Dict[str, Any], provider: Any, base_url: Any) 
     usd, status = 0.0, "unknown"
     try:
         r = estimate_usage_cost(str(model or ""), cu, provider=provider or None, base_url=base_url or None)
+        if r.amount_usd is None:
+            listed = claude_list_price_model(model, provider)
+            if listed:  # subscription CLI: the API list-price equivalent, never the (flat-rate) bill
+                r = estimate_usage_cost(listed, cu, provider="anthropic")
         status = r.status if r.status in COST_STATUSES else "unknown"
         if r.amount_usd is None:
             status = "unknown"  # tokens counted, dollars not: the thread total becomes a lower bound
@@ -442,6 +446,25 @@ def price_call(model: Any, usage: Dict[str, Any], provider: Any, base_url: Any) 
     except Exception:
         logger.debug("briefling: pricing failed for %s", model, exc_info=True)
     return {"usd": usd, "calls": 1, **tokens, "status": status}
+
+
+def claude_list_price_model(model: Any, provider: Any) -> Optional[str]:
+    """Anthropic catalogue id of a Claude model served by an ``external_process`` provider, else None.
+
+    Such a provider (e.g. Claude subscription DirectSDK) prices from ``usage.raw_usage``, which the
+    ``post_api_request`` hook drops: it always answers ``unknown`` here. Its aliases (``opus``) map to the
+    native route; the ``[1m]`` suffix is stripped, so prompts over 200k are priced at the base rate.
+    """
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(str(provider or ""))
+    except Exception:
+        return None
+    if profile is None or getattr(profile, "auth_type", "") != "external_process":
+        return None
+    name = str(model or "").strip().removesuffix("[1m]")
+    name = (getattr(profile, "model_aliases", None) or {}).get(name, name).removesuffix("[1m]")
+    return name if name.startswith("claude-") else None
 
 
 def _usage_thread() -> Optional[str]:
