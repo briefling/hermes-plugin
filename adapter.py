@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.81"
+VERSION = "0.3.82"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -2212,10 +2212,55 @@ def _session_thread(tool: str) -> Tuple[Optional[str], Optional[str]]:
     return get_session_env("HERMES_SESSION_CHAT_ID", ""), None
 
 
-def _on_adapter(tool: str, thread: str, call, timeout: float = 30) -> str:
-    """Run ``call(adapter)`` on the gateway loop of the adapter serving ``thread`` (tools run in the agent's Python thread)."""
+def _cron_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """The cron job record (Hermes' store of this profile), or None. Separate so tests can replace it."""
+    from cron.jobs import get_job
+    return get_job(job_id)
+
+
+def _cron_thread(tool: str, task_id: Any) -> Tuple[Optional[str], Optional[str]]:
+    """(thread, None) when this call runs in a Hermes cron job whose ``deliver`` names exactly one briefling thread,
+    else (None, error) or (None, None) outside a cron run. Hermes clears the session vars in a cron run on purpose
+    (no tool acts as the origin user), so the only target allowed is the one the job delivers to; the hub then
+    accepts the card only from that thread's agent in charge, while no turn runs there."""
+    from gateway.session_context import get_session_env
+    if not (isinstance(task_id, str) and task_id.startswith("cron:")) or get_session_env("HERMES_CRON_SESSION", "") not in ("1", "true"):
+        return None, None
+    job_id = task_id.split(":")[1]
+    try:
+        job = _cron_job(job_id)
+    except Exception as e:  # noqa: BLE001 - a store read error is a refusal, never a crash of the run
+        logger.warning("cron job %s unreadable: %s", job_id, type(e).__name__)
+        job = None
+    deliver = job.get("deliver") if isinstance(job, dict) else None
+    targets = [p.strip().split(":", 1)[1].strip() for p in (deliver if isinstance(deliver, str) else "").split(",")
+               if p.strip().lower().startswith("briefling:")]
+    spaces = {s for a in list(_ADAPTERS) for s in a._hub_spaces}
+    threads = [t for t in dict.fromkeys(targets) if ID_RE.fullmatch(t) and t not in spaces]
+    if len(threads) != 1:
+        return None, (f"{tool} in a cron job needs the job to deliver to one briefling thread (deliver=briefling:<thread id>); "
+                      f"this job delivers to {deliver or 'nothing'}.")
+    return threads[0], None
+
+
+def _tool_thread(tool: str, task_id: Any) -> Tuple[Optional[str], Optional[str]]:
+    """The conversation of a tool call: the session's, else (cron run) the thread its job delivers to."""
+    thread, err = _session_thread(tool)
+    if not err:
+        return thread, None
+    cron, cerr = _cron_thread(tool, task_id)
+    return (cron, None) if cron else (None, cerr or err)
+
+
+def _on_adapter(tool: str, thread: str, call, timeout: float = 30, any_adapter: bool = False) -> str:
+    """Run ``call(adapter)`` on the gateway loop of the adapter serving ``thread`` (tools run in the agent's Python thread).
+    ``any_adapter``: a cron's target thread may never have been delivered here; the only connected adapter then serves
+    it (the hub checks the instance's right on it)."""
     from tools.registry import tool_error
     adapter = next((a for a in list(_ADAPTERS) if thread in a._thread_space), None)
+    if adapter is None and any_adapter:
+        live = [a for a in list(_ADAPTERS) if a._loop is not None]
+        adapter = live[0] if len(live) == 1 else None
     if adapter is None or adapter._loop is None:
         return tool_error("briefling is not connected for this conversation.")
     try:
@@ -2283,16 +2328,17 @@ def request_elevation_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("request_elevation", thread, lambda a: a.request_elevation(thread, account, minutes, reason))
 
 
-def ask_choices_tool(args: Dict[str, Any], **_: Any) -> str:
-    """Tool handler: ask.choices (a « To decide » card; the hub checks the turn and the agent in charge)."""
+def ask_choices_tool(args: Dict[str, Any], task_id: str = "", **_: Any) -> str:
+    """Tool handler: ask.choices (a « To decide » card; the hub checks the turn and the agent in charge). In a cron
+    run, the card goes to the thread the job delivers to (_cron_thread)."""
     from tools.registry import tool_error
-    thread, err = _session_thread("ask_choices")
+    thread, err = _tool_thread("ask_choices", task_id)
     if err:
         return tool_error(err)
     frame, bad = build_ask_choices(args)
     if bad:
         return tool_error(bad)
-    return _on_adapter("ask_choices", thread, lambda a: a.ask_choices(thread, frame))
+    return _on_adapter("ask_choices", thread, lambda a: a.ask_choices(thread, frame), any_adapter=True)
 
 
 def propose_plan_tool(args: Dict[str, Any], **_: Any) -> str:

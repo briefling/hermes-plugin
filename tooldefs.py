@@ -125,7 +125,8 @@ _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 
 ASK_ERRORS = {
     "not_in_charge": "You are a guest in this thread (called by a mention): only its agent in charge asks here.",
-    "no_turn": "Only during your turn in this conversation.",
+    "no_turn": ("Only during your turn in this conversation, or from a cron job delivering to a thread you are in "
+                "charge of, while no turn runs there."),
     "forbidden": "Not allowed for this instance.",
     "bad_frame": (f"Invalid card: 1 to {ASK_ITEMS_MAX} questions, each with a one-line label (max {ASK_LABEL_MAX}), "
                   f"a question (max {ASK_ITEM_Q_MAX}) and {ASK_OPTIONS_MIN} to {ASK_OPTIONS_MAX} one-line choices "
