@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.84"
+VERSION = "0.3.85"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1181,6 +1181,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
                 await self._flow_report(host, force=True)
             self._offer_update(frame.get("release"))
+        elif kind == "release":  # pushed by the hub once per deploy: no wait for the next connection
+            self._offer_update(frame.get("release"))
         elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
@@ -2027,7 +2029,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         return sent
 
     def _offer_update(self, release: Any) -> None:
-        """`subscribed.release`: a newer release starts the self-update (one at a time, this profile only)."""
+        """`subscribed.release` or a pushed `release`: a newer release starts the self-update (one at a time, this profile only)."""
         rel = selfupdate.valid_release(release)
         if not self._auto_update or rel is None or not selfupdate.is_newer(rel["version"], VERSION):
             return
