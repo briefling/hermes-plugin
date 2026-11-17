@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.83"
+VERSION = "0.3.84"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -387,6 +387,39 @@ def is_s3_url(url: Any) -> bool:
 
 # Live adapters (one per profile in a multiplexed gateway): the tool finds the one serving its thread.
 _ADAPTERS: "weakref.WeakSet[BrieflingAdapter]" = weakref.WeakSet()
+# thread -> space, per agent identity (client_id), shared by every adapter instance of that agent: Hermes builds a
+# FRESH adapter on each reconnect retry while the agent's sessions keep running, so a per-instance map would forget
+# every thread until its next deliver (the tools then answered « not connected for this conversation »).
+_THREAD_SPACES: Dict[str, Dict[str, str]] = {}
+
+
+def _profile_key(name: Any) -> Optional[str]:
+    """None for the default profile, else the profile name (Hermes' ``set_owner_profile`` convention)."""
+    name = name.strip() if isinstance(name, str) else ""
+    return None if not name or name == "default" else name
+
+
+def _adapter_of(thread: Optional[str], fallback: bool = False) -> Optional["BrieflingAdapter"]:
+    """The adapter serving ``thread`` for the running call. In a briefling session, only the adapters of the session's
+    profile qualify (two agents of one gateway may serve the same topic: never send as the other one). ``fallback``
+    (hub requests, which the hub checks again): a thread no instance of the agent saw goes to the profile's only live
+    adapter. Outside a session (cron run, hook without session), only an adapter that saw the thread."""
+    if not thread:
+        return None
+    live = list(_ADAPTERS)
+    try:
+        from gateway.session_context import get_session_env
+        in_session = get_session_env("HERMES_SESSION_PLATFORM", "") == "briefling"
+        profile = _profile_key(get_session_env("HERMES_SESSION_PROFILE", ""))
+    except Exception:
+        in_session, profile = False, None
+    if in_session:
+        live = [a for a in live if _profile_key(getattr(a, "_owner_profile", None)) == profile] or live
+    known = [a for a in live if thread in a._thread_space]
+    if known or not fallback:
+        return known[0] if known else None
+    live = [a for a in live if a._loop is not None]
+    return live[0] if in_session and len(live) == 1 else None
 
 
 # -- LLM spend per thread ------------------------------------------------------------------------
@@ -643,7 +676,7 @@ def on_pre_llm_call(task_id: str = "", session_id: str = "", turn_id: str = "", 
         logger.warning("[briefling] agent run start not tracked", exc_info=True)
     try:
         thread = _usage_thread()
-        adapter = next((a for a in list(_ADAPTERS) if thread and thread in a._thread_space), None)
+        adapter = _adapter_of(thread)
         if adapter is None or not adapter._projects:
             return None
         space = adapter._thread_space.get(thread, "")
@@ -666,10 +699,6 @@ def on_pre_llm_call(task_id: str = "", session_id: str = "", turn_id: str = "", 
 # long as the agent works: else the thread shows "quiet" and the hub refuses its turn-only frames (no_turn).
 _runs_lock = threading.Lock()
 _runs: Dict[str, Dict[str, str]] = {}  # thread -> {session: turn id} of top-level agent runs in progress
-
-
-def _adapter_of(thread: Optional[str]) -> Optional["BrieflingAdapter"]:
-    return next((a for a in list(_ADAPTERS) if thread and thread in a._thread_space), None)
 
 
 def _on_loop(adapter: "BrieflingAdapter", make, wait: float = 5.0) -> None:
@@ -879,7 +908,8 @@ class BrieflingAdapter(BasePlatformAdapter):
                 if _get_scoped_secret(env, "").strip():
                     logger.warning("[briefling] BRIEFLING_ALLOWED_FROM=hub but %s is set: the gateway checks that list "
                                    "first, remove it to follow the hub", env)
-        self._thread_space: Dict[str, str] = {}  # thread -> space (needed to upload a file into it)
+        # thread -> space (needed to upload a file into it), the agent's own map: inherited by its next instances
+        self._thread_space: Dict[str, str] = _THREAD_SPACES.setdefault(self._client_id, {}) if self._client_id else {}
         self._hub_spaces: set = set()  # spaces the hub opened on the last `subscribed`: `send(<space>)` opens a topic there
         self._waiting: Dict[str, asyncio.Future] = {}  # client_id -> future(upload.ready / ack frame)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2280,7 +2310,7 @@ def _on_adapter(tool: str, thread: str, call, timeout: float = 30, any_adapter: 
     ``any_adapter``: a cron's target thread may never have been delivered here; the only connected adapter then serves
     it (the hub checks the instance's right on it)."""
     from tools.registry import tool_error
-    adapter = next((a for a in list(_ADAPTERS) if thread in a._thread_space), None)
+    adapter = _adapter_of(thread, fallback=True)
     if adapter is None and any_adapter:
         live = [a for a in list(_ADAPTERS) if a._loop is not None]
         adapter = live[0] if len(live) == 1 else None
@@ -2597,7 +2627,7 @@ def voice_open_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_: An
     thread, err = _session_thread("voice_open")
     if err:
         return tool_error(err)
-    adapter = next((a for a in list(_ADAPTERS) if thread in a._thread_space), None)
+    adapter = _adapter_of(thread)
     voice_dir = adapter._voice_dir if adapter is not None else ""
     if not voice_dir:
         return tool_error("no voice daemon is set up for you on this host (BRIEFLING_VOICE): the human can still send voice notes.")
