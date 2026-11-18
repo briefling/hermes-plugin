@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.86"
+VERSION = "0.3.87"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -280,27 +280,31 @@ def is_notice(text: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
 
 
 # Text written in the same model step as a tool call (a card, propose_*) is streamed to the thread at once; the model
-# often restates it in its final reply. A text of the turn shorter than this is never matched (a status line said twice).
+# often restates it in its final reply, whole or in part, before or after a new line. Repeated paragraphs adding up to
+# less than this are kept (a short status line said twice).
 REPEAT_MIN = 40
+_PARAGRAPHS = re.compile(r"\n[ \t]*\n")
 
 
 def strip_posted(content: str, posted: List[str], typing: bool = False) -> str:
-    """``content`` without the texts already posted in this turn (each ``posted`` text ≥ REPEAT_MIN, matched whole).
-    ``typing`` (a streamed message not finalized yet): also hold back a tail, from a line start, that is the beginning
-    of one of them, so a repeat never shows half typed. Returns ``content`` itself when nothing matched."""
-    olds = sorted({p.strip() for p in posted if len(p.strip()) >= REPEAT_MIN}, key=len, reverse=True)
-    out = content
-    for p in olds:
-        out = out.replace(p, "")
-    if typing and olds:
-        for i in [0] + [m.end() for m in re.finditer(r"\n", out)]:
-            tail = out[i:].strip()
-            if tail and any(p.startswith(tail) for p in olds):
-                out = out[:i]
-                break
-    if out == content:
+    """``content`` without its paragraphs found whole in a text already posted in this turn, when they add up to at
+    least REPEAT_MIN chars. ``typing`` (a streamed message not finalized yet): also hold back a last paragraph that is
+    the beginning of a posted paragraph, so a repeat never shows half typed. Returns ``content`` itself when unchanged."""
+    olds = [p.strip() for p in posted if p.strip()]
+    if not olds:
         return content
-    return re.sub(r"\n{3,}", "\n\n", out).strip()
+    blocks = [b.strip() for b in _PARAGRAPHS.split(content)]
+    repeated = {i for i, b in enumerate(blocks) if b and any(b in p for p in olds)}
+    if sum(len(blocks[i]) for i in repeated) < REPEAT_MIN:
+        repeated = set()
+    kept = [b for i, b in enumerate(blocks) if b and i not in repeated]
+    if typing and kept:
+        old_blocks = [ob.strip() for p in olds for ob in _PARAGRAPHS.split(p)]
+        if any(ob.startswith(kept[-1]) for ob in old_blocks):
+            kept.pop()
+    if len(kept) == len([b for b in blocks if b]):
+        return content
+    return "\n\n".join(kept)
 
 
 RECONNECT_BACKOFF = [1, 2, 5, 10, 30, 60]
