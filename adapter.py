@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.85"
+VERSION = "0.3.86"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -277,6 +277,32 @@ def is_notice(text: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
     if metadata and metadata.get("non_conversational"):
         return True
     return any(p.match(text or "") for p in NOTICE_PATTERNS)
+
+
+# Text written in the same model step as a tool call (a card, propose_*) is streamed to the thread at once; the model
+# often restates it in its final reply. A text of the turn shorter than this is never matched (a status line said twice).
+REPEAT_MIN = 40
+
+
+def strip_posted(content: str, posted: List[str], typing: bool = False) -> str:
+    """``content`` without the texts already posted in this turn (each ``posted`` text ≥ REPEAT_MIN, matched whole).
+    ``typing`` (a streamed message not finalized yet): also hold back a tail, from a line start, that is the beginning
+    of one of them, so a repeat never shows half typed. Returns ``content`` itself when nothing matched."""
+    olds = sorted({p.strip() for p in posted if len(p.strip()) >= REPEAT_MIN}, key=len, reverse=True)
+    out = content
+    for p in olds:
+        out = out.replace(p, "")
+    if typing and olds:
+        for i in [0] + [m.end() for m in re.finditer(r"\n", out)]:
+            tail = out[i:].strip()
+            if tail and any(p.startswith(tail) for p in olds):
+                out = out[:i]
+                break
+    if out == content:
+        return content
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
 RECONNECT_BACKOFF = [1, 2, 5, 10, 30, 60]
 PING_EVERY_S = 300            # API Gateway closes idle connections after 10 min
 RECYCLE_AFTER_S = 110 * 60    # ... and every connection after 2 h: reconnect before
@@ -923,6 +949,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._turns: set = set()  # threads whose turn is running here (processing hooks)
         self._owed_end: Dict[str, str] = {}  # thread -> message id: turn.ended due when its agent run ends
         self._spoke: set = set()  # threads with non-empty text posted since their turn started (waiting gate)
+        # thread -> {msg_id: text shown}: the agent's words posted in the running turn; a later message of the turn
+        # drops what repeats them (strip_posted). Cleared when a turn starts.
+        self._posted: Dict[str, Dict[str, str]] = {}
         # Threads whose turn_outcome posted its text: the model's final reply that the gateway still sends is the same
         # answer reworded (every answer showed twice), so send() drops it until the next turn starts.
         self._answered: set = set()
@@ -1357,14 +1386,37 @@ class BrieflingAdapter(BasePlatformAdapter):
         if chat_id in ("", "off"):  # bare `deliver=briefling`: BRIEFLING_HOME_CHANNEL=off, no home conversation
             return SendResult(success=False, message_id=None, error="briefling has no home channel: use deliver=briefling:<space id>")
         msg_id = new_id()
-        frame: Dict[str, Any] = {"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": content[:MAX_TEXT], "rev": self._next_rev()}
         notice = is_notice(content, metadata)
+        if not notice:
+            content = self._unrepeated(chat_id, msg_id, content, typing=bool((metadata or {}).get("expect_edits")))
+            if content is None:  # all of it was posted already in this turn: nothing to show (yet, if streamed)
+                return SendResult(success=True, message_id=msg_id)
+        frame: Dict[str, Any] = {"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": content[:MAX_TEXT], "rev": self._next_rev()}
         if notice:
             frame["notice"] = True
         ok = await self._send_frame(frame)
         if not notice:  # a gateway notice is not an answer: it must not unlock turn_outcome waiting
             self._mark_spoke(chat_id, content, ok)
+            self._record_posted(chat_id, msg_id, content, ok)
         return SendResult(success=ok, message_id=msg_id if ok else None, error=None if ok else "hub not connected")
+
+    def _unrepeated(self, thread: str, msg_id: str, content: str, typing: bool) -> Optional[str]:
+        """``content`` minus what other messages of this turn already posted; None = nothing new to send now."""
+        if thread not in self._turns:  # a cron or a notification outside a turn: never compared
+            return content
+        posted = self._posted.get(thread, {})
+        kept = strip_posted(content, [t for m, t in posted.items() if m != msg_id], typing)
+        if kept is content:
+            return content
+        if not kept.strip() or kept == posted.get(msg_id):
+            logger.info("[%s] repeat of this turn's text dropped in %s (%d chars)", self.name, thread, len(content))
+            return None
+        logger.info("[%s] repeat of this turn's text cut in %s (%d -> %d chars)", self.name, thread, len(content), len(kept))
+        return kept
+
+    def _record_posted(self, thread: str, msg_id: str, content: str, ok: bool) -> None:
+        if ok and content.strip() and thread in self._turns:
+            self._posted.setdefault(str(thread), {})[msg_id] = content
 
     async def _open_topic(self, space: str, content: str) -> SendResult:
         """`topic.open`: a Lounge topic in `space` whose first message is `content`, signed by this agent (the hub caps
@@ -1866,8 +1918,12 @@ class BrieflingAdapter(BasePlatformAdapter):
         return await self._send_file(chat_id, file_path, caption, file_name)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+        content = self._unrepeated(chat_id, message_id, content, typing=not finalize)
+        if content is None:  # a streamed repeat of this turn's text: the thread keeps what it shows
+            return SendResult(success=True, message_id=message_id)
         ok = await self._send_frame({"type": "message.final", "thread": chat_id, "msg_id": message_id, "text": content[:MAX_TEXT], "rev": self._next_rev()})
         self._mark_spoke(chat_id, content, ok)
+        self._record_posted(chat_id, message_id, content, ok)
         return SendResult(success=ok, message_id=message_id if ok else None, error=None if ok else "hub not connected")
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
@@ -1963,6 +2019,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._turns.add(thread)
         self._spoke.discard(thread)
         self._answered.discard(thread)
+        self._posted.pop(thread, None)
         self._stop_asked.pop(thread, None)
         take_acted(thread)  # tools of an earlier turn don't count
         self._reset_progress(thread)
@@ -1988,6 +2045,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             msg_id = self._owed_end.pop(thread)
         self._turns.discard(thread)
         self._spoke.discard(thread)
+        self._posted.pop(thread, None)
         self._reset_progress(thread)
         if _thumbs.end(thread):  # the tabs drop the browser thumbnail at once
             await self._send_frame(bthumb.end_frame(thread))
