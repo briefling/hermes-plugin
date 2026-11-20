@@ -89,7 +89,7 @@ message:
 - `BRIEFLING_PROJECTS_ROOT`: absolute folder holding the agent's own clones, one per project
   (`<root>/<org>/<project>`). Use a folder of the agent's own, not the host's working copies: a git hook or a
   `core.fsmonitor` written from the sandbox would run on the host at its next `git` command there.
-- `BRIEFLING_PROJECTS`: `space=org/project` pairs, comma separated (`liseuse=acme/liseuse,jul=acme/jul`).
+- `BRIEFLING_PROJECTS`: `space=org/project` pairs, comma separated (`web=acme/web,api=acme/api`).
 
 Refused, so nothing mounted: a space without an entry, a malformed entry, a folder that does not exist, leaves the
 root (`..`, symlink) or lies under `~/projects`, `/root` or `/workspace` (never mounted by Hermes). The folder is registered once per conversation, before its first
