@@ -155,6 +155,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     build_radar_signal,
     build_radar_profile,
     OUTCOME_ERRORS,
+    clean_settled_leads,
     RESOURCE_ERRORS,
     ABOUT_ERRORS,
     APPLET_ERRORS,
@@ -239,7 +240,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.90"
+VERSION = "0.3.91"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1714,7 +1715,8 @@ class BrieflingAdapter(BasePlatformAdapter):
 
     async def turn_outcome(self, thread: str, outcome: str, action: str = "",
                            summary: Optional[Dict[str, Any]] = None, resume: bool = False,
-                           tags: Optional[List[str]] = None, text: str = "") -> Dict[str, Any]:
+                           tags: Optional[List[str]] = None, text: str = "",
+                           settled_leads: Optional[List[str]] = None) -> Dict[str, Any]:
         """Tell the hub how this turn ends (done, or waiting for a human action), with the thread's summary if given.
         ``text`` (the answer written in the same model step, not posted yet) is posted first. The hub applies the gates."""
         self._answered.discard(thread)
@@ -1731,6 +1733,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             frame["summary"] = summary
         if tags:
             frame["tags"] = tags
+        if settled_leads:
+            frame["settled_leads"] = settled_leads
         try:
             await self._request(frame)
         except HubRefused as e:
@@ -2609,7 +2613,10 @@ def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
     text = str(args.get("text") or "").strip()
     if len(text) > MAX_TEXT:
         return tool_error(f"text too long ({len(text)} chars, max {MAX_TEXT}): post the rest as a message first.")
-    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary, resume is True, tags, text))
+    settled, err = clean_settled_leads(args.get("settled_leads"), outcome)
+    if err:
+        return tool_error(err)
+    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary, resume is True, tags, text, settled))
 
 
 def _resource_args(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
