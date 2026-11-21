@@ -79,6 +79,7 @@ import asyncio
 import functools
 import base64
 import contextvars
+import dataclasses
 import json
 import logging
 import re
@@ -238,7 +239,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.89"
+VERSION = "0.3.90"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -847,6 +848,48 @@ def voice_hint(files: Any) -> str:
     return VOICE_HINT if any(is_recording(f) for f in (files if isinstance(files, list) else [])) else ""
 
 
+# Text attachments (a long paste the client turns into a collage-<date>.txt): their content rides in the message, as the
+# gateway's own adapters do for a .txt (100 KB), so the agent reads it with no tool call. Over the cap (all the event's
+# text files together), the gateway's note tells the agent to read the cached file instead.
+TEXT_INLINE_MIME = {"text/plain"}
+MAX_TEXT_INLINE = 100 * 1024
+
+
+def inline_texts(paths: List[str], kept: List[Dict[str, Any]], own: Any = None, author: str = "") -> Tuple[str, List[bool]]:
+    """(block appended to the message text, one « content inlined » flag per downloaded file, same order). Only the
+    files of the message's author are inlined (`by`, or the message's own files from an older hub): a text file from
+    another member or agent stays a file, so its words never read as the author's."""
+    mine = {f.get("id") for f in (own if isinstance(own, list) else []) if isinstance(f, dict)}
+    ours = lambda f: (bool(author) and f["by"] == author) if "by" in f else f.get("id") in mine
+    budget, parts, flags = MAX_TEXT_INLINE, [], []
+    for path, f in zip(paths, kept):
+        ok = False
+        if ours(f) and str(f.get("mime") or "").split(";")[0].strip().lower() in TEXT_INLINE_MIME:
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read(budget + 1)
+                if len(data) <= budget:
+                    parts.append(f"[Content of {f.get('name') or os.path.basename(path)}]:\n"
+                                 + data.decode("utf-8-sig", errors="replace").rstrip("\n"))
+                    budget -= len(data)
+                    ok = True
+            except OSError as e:
+                logger.warning("text attachment not inlined: %s", type(e).__name__)
+        flags.append(ok)
+    return "\n\n".join(parts), flags
+
+
+def media_extras(names: List[str], inlined: List[bool]) -> Dict[str, Any]:
+    """MessageEvent fields of a recent gateway (original names, « text inlined » flags); an older one has neither."""
+    have = {f.name for f in dataclasses.fields(MessageEvent)} if dataclasses.is_dataclass(MessageEvent) else set()
+    out: Dict[str, Any] = {}
+    if "media_filenames" in have:
+        out["media_filenames"] = names
+    if "media_text_inlined" in have:
+        out["media_text_inlined"] = inlined
+    return out
+
+
 def inbound_type(own: Any, kept: List[Dict[str, Any]], author: str = "") -> MessageType:
     """Gateway type of a delivered message. `own`: the message's own files; `kept`: the downloaded files (its own
     and those of the unseen messages before it, each with `by` = its message's author); `author`: the message's
@@ -1260,10 +1303,13 @@ class BrieflingAdapter(BasePlatformAdapter):
         # longer a command and, during a turn, the gateway takes it as a redirect of the running run.
         media_urls, media_types, kept = await self._download_files(frame.get("files") or [])
         msg_type = inbound_type(msg.get("files"), kept, str(author.get("id") or ""))
+        inlined: List[bool] = [False] * len(kept)
         if not MessageEvent(text=text).get_command():
+            pasted, inlined = inline_texts(media_urls, kept, msg.get("files"), str(author.get("id") or ""))
             text = with_context(frame.get("context") or {},
                                 vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True
-                                 else VOICE_TALK_HINT if self._previews.share_of(thread, pv.VOICE) else "") + text,
+                                 else VOICE_TALK_HINT if self._previews.share_of(thread, pv.VOICE) else "") + text
+                                + (f"\n\n{pasted}" if pasted else ""),
                                 mounted=self._mounted(str(frame.get("space") or "")))
         source = self.build_source(
             chat_id=thread, chat_name=self._titles[thread], chat_type="dm",
@@ -1274,7 +1320,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             ts = datetime.now(tz=timezone.utc)
         await self.handle_message(MessageEvent(
             text=text.strip(), message_type=msg_type, source=source, message_id=msg_id, raw_message=frame, timestamp=ts,
-            media_urls=media_urls, media_types=media_types))
+            media_urls=media_urls, media_types=media_types,
+            **media_extras([str(f.get("name") or "") for f in kept], inlined)))
 
     async def _on_secret(self, frame: Dict[str, Any]) -> None:
         """Hub ``secret.deliver``: decrypt, store outside the conversation, answer ``secret.received``. Only reason
