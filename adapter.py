@@ -240,7 +240,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.91"
+VERSION = "0.3.92"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -992,7 +992,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._last_turn_at: Dict[str, int] = {}
         self._rev = 0  # global and increasing: orders the edits of a message (hub drops older ones)
         self._sent_status: Dict[str, tuple] = {}  # thread -> last (text, steps, recent) relayed (frame only on change)
-        self._activity: Dict[str, deque] = {}  # thread -> last tool phrases of the running turn (status.recent)
+        self._activity: Dict[str, deque] = {}  # thread -> (phrase, start ms) of the last tools of the turn (status.recent/recentAt)
         self._turn_since: Dict[str, int] = {}  # thread -> turn start (ms), status.since
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=600)
         self._opened = asyncio.Event()
@@ -2028,12 +2028,13 @@ class BrieflingAdapter(BasePlatformAdapter):
         super().set_status_text(chat_id, safe)
         if safe:
             feed = self._activity.setdefault(str(chat_id), deque(maxlen=MAX_ACTIVITY))
-            if not feed or feed[-1] != safe:
-                feed.append(safe)
+            if not feed or feed[-1][0] != safe:
+                feed.append((safe, int(time.time() * 1000)))  # its start time: status.recentAt
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         text = (getattr(self, "_status_text", {}).get(str(chat_id)) or "").strip()[:MAX_STATUS] or None
-        steps, recent = steps_of(chat_id), list(self._activity.get(chat_id, ()))
+        feed = list(self._activity.get(chat_id, ()))
+        steps, recent, recent_at = steps_of(chat_id), [p for p, _ in feed], [at for _, at in feed]
         key = (text, steps, tuple(recent))
         if self._sent_status.get(chat_id, (None, 0, ())) == key:
             return
@@ -2041,7 +2042,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         since = self._turn_since.get(chat_id)
         await self._send_frame({"type": "status", "thread": chat_id, "text": text, "rev": self._next_rev(),
                                 **({"since": since} if since else {}), **({"steps": steps} if steps else {}),
-                                **({"recent": recent} if recent else {})})
+                                **({"recent": recent, "recentAt": recent_at} if recent else {})})
 
     async def stop_typing(self, chat_id: str) -> None:
         # No frame: the turn end clears the line on the client (and the hub refuses status out of a turn).
