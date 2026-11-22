@@ -22,6 +22,8 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   forged by any content the agent quotes). The hub applies the gates; a human opens the thread.
 - tool ``propose_space_about`` -> ``about.propose``: in a Lounge topic, at the admin's request, the agent in charge
   drafts the space description; briefling shows it as a card, the admin applies it to the settings and saves.
+- tool ``propose_action`` -> ``action.propose``: the agent proposes a new action of the space (name, rule, allowed
+  agents, N, human go); briefling shows a card, a space admin approves it (then it is in Settings › Actions) or refuses it.
 - tool ``propose_issue`` -> ``issue.propose``: in a Lounge topic or a thread of a board-driven space, the agent asks
   briefling to show a "Create this issue?" card (repo, title, body). Nothing is written to GitHub until a trusted
   human clicks Create the issue; the hub applies the gates.
@@ -143,6 +145,9 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     PLAN_ERRORS,
     PLAN_SCHEMA,
     build_plan,
+    build_propose_action,
+    PROPOSE_ACTION_ERRORS,
+    PROPOSE_ACTION_SCHEMA,
     RADAR_ERRORS,
     RADAR_SIGNAL_SCHEMA,
     MAIL_IMPORT_SCHEMA,
@@ -251,7 +256,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.96"
+VERSION = "0.3.97"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1689,6 +1694,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         return {"ok": True, "card": ack.get("msg_id"),
                 "detail": CARD_SHOWN["propose_space_about"]}
 
+    async def propose_action(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """action.propose: a « Add this action? » card (frame from build_propose_action). Never saved by the agent: an admin approves."""
+        try:
+            ack = await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": PROPOSE_ACTION_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["propose_action"]}
+
     async def applet_propose(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
         """applet.propose: an applet card in the conversation. Never saved by the agent: a lead saves it."""
         try:
@@ -2585,6 +2600,18 @@ def propose_space_about_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("propose_space_about", thread, lambda a: a.propose_space_about(thread, text, str(args.get("why") or "")))
 
 
+def propose_action_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: action.propose (a card; the hub checks the lead's turn, the agent in charge and the action)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("propose_action")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_propose_action(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("propose_action", thread, lambda a: a.propose_action(thread, frame))
+
+
 def applet_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: applet.propose (a card; the hub checks the lead's turn, the agent and the schema)."""
     from tools.registry import tool_error
@@ -3436,6 +3463,8 @@ def register(ctx) -> None:
                           description=PLAN_SCHEMA["description"], emoji="🗺️")
         ctx.register_tool(name="propose_space_about", toolset="briefling", schema=ABOUT_SCHEMA, handler=propose_space_about_tool,
                           description=ABOUT_SCHEMA["description"], emoji="📝")
+        ctx.register_tool(name="propose_action", toolset="briefling", schema=PROPOSE_ACTION_SCHEMA, handler=propose_action_tool,
+                          description=PROPOSE_ACTION_SCHEMA["description"], emoji="➕")
         ctx.register_tool(name="topic_title", toolset="briefling", schema=TOPIC_TITLE_SCHEMA, handler=topic_title_tool,
                           description=TOPIC_TITLE_SCHEMA["description"], emoji="🏷️")
         ctx.register_tool(name="turn_outcome", toolset="briefling", schema=OUTCOME_SCHEMA, handler=turn_outcome_tool,
