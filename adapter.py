@@ -128,6 +128,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     NEW_ISSUE_TITLE_MAX,
     NEW_ISSUE_BODY_MAX,
     REPO_RE,
+    BOARD_REPO_RE,
     ID_RE,
     MEMORY_NUDGE,
     CARD_SHOWN,
@@ -240,7 +241,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.92"
+VERSION = "0.3.93"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -2472,8 +2473,8 @@ def propose_issue_tool(args: Dict[str, Any], **_: Any) -> str:
     repo = str(args.get("repo") or "").strip()
     title = " ".join(str(args.get("title") or "").split())
     body = str(args.get("body") or "").strip()
-    if not REPO_RE.fullmatch(repo):
-        return tool_error("repo is required, as owner/name (one of the repos listed in the message context).")
+    if not BOARD_REPO_RE.fullmatch(repo):
+        return tool_error("repo is required, as owner/name or a GitLab group/project (one of the repos listed in the message context).")
     if not title or len(title) > NEW_ISSUE_TITLE_MAX:
         return tool_error(f"title is required, one line, max {NEW_ISSUE_TITLE_MAX} chars.")
     if len(body) > NEW_ISSUE_BODY_MAX:
