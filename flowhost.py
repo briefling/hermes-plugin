@@ -36,6 +36,7 @@ from .flowconfig import ConfigStore
 from . import flowswitch
 from .flowswitch import SwitchError
 from .flow.backends.github import GitHubBoard
+from .flow.backends.gitlab import GitLabBoard, GitLabError
 from .flow.identity import make_token
 from .flow.model import AGENT_MARK
 from .flow.poll import MONTH_S, poll
@@ -51,6 +52,7 @@ ZERO = {k: 0 for k in USAGE_KEYS}
 ALERTS_SHOWN = 5                 # flow.state: the latest engine alerts of the last week (lost task, quota pause)
 ALERTS_AGE_S = 7 * 86400
 TAGS = ("task", "discussion")
+HUB_CALL_S = 30.0               # a board read through the hub (GitLab): one page of issues and their notes
 
 
 def local_day(ts: float) -> str:
@@ -136,7 +138,11 @@ class FlowHost:
         self.path = state_dir / ("flow-%s-%s.json" % (fs.space, fs.agent))
         self.token_dir = state_dir
         self._request, self._inject, self._clock = request, inject, clock
-        self._make_board = make_board or self._github_board
+        self._make_board = make_board or self._board
+        try:   # the loop the hub calls run on: the engine and the board tools call the GitLab board from other threads
+            self._loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
         self.configs = ConfigStore(state_dir / "config" / fs.space)
         self._company_default = company is None
         self._company = company or (lambda: load_company(self.config_dir()))
@@ -249,9 +255,35 @@ class FlowHost:
     def company(self) -> Company:
         return self._company()
 
+    def _board(self, co: Company, dept: Department):
+        """`board.type: gitlab` = the space's GitLab board, read and written by the hub; else a GitHub Project."""
+        if str(dept.board.get("type") or "") == "gitlab":
+            return GitLabBoard(self.fs.space, self.fs.agent, dept.flow, bots(co), self.hub_call)
+        return self._github_board(co, dept)
+
     def _github_board(self, co: Company, dept: Department):
         token = make_token(self.fs.identity, dept.board["owner"], cache_dir=self.token_dir) if self.fs.identity else None
         return GitHubBoard(dept.board, dept.flow, bots(co), token=token)
+
+    def hub_call(self, frame: Dict[str, Any], timeout: float = HUB_CALL_S) -> Dict[str, Any]:
+        """A hub frame from a worker thread (the tick's engine, a board tool): run on the host's loop, waited here.
+        A hub refusal raises GitLabError(code), so the agent and the logs see why (never a token: the hub keeps it)."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            raise GitLabError("briefling hub not reachable")
+        try:
+            if asyncio.get_running_loop() is loop:
+                raise GitLabError("hub call from the event loop thread")   # would deadlock: a bug, never silent
+        except RuntimeError:
+            pass
+        fut = asyncio.run_coroutine_threadsafe(self._request(frame), loop)
+        try:
+            return fut.result(timeout)
+        except HubAnswer as e:
+            raise GitLabError("hub refused %s: %s" % (frame.get("type"), e)) from e
+        except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            fut.cancel()
+            raise GitLabError("briefling hub not reachable (%s)" % type(e).__name__) from e
 
     def boards(self, co: Company) -> Dict[str, Any]:
         return {d.name: self._make_board(co, d) for d in co.departments_of(self.fs.agent)}

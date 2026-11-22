@@ -22,6 +22,8 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
   forged by any content the agent quotes). The hub applies the gates; a human opens the thread.
 - tool ``propose_space_about`` -> ``about.propose``: in a Lounge topic, at the admin's request, the agent in charge
   drafts the space description; briefling shows it as a card, the admin applies it to the settings and saves.
+- tool ``agent_card`` -> ``agentcard.write`` / ``agentcard.read``: the agent writes its own identity card in the
+  space (OS, hardware) or reads the space's cards on demand (never injected into a turn)
 - tool ``propose_action`` -> ``action.propose``: the agent proposes a new action of the space (name, rule, allowed
   agents, N, human go); briefling shows a card, a space admin approves it (then it is in Settings › Actions) or refuses it.
 - tool ``propose_issue`` -> ``issue.propose``: in a Lounge topic or a thread of a board-driven space, the agent asks
@@ -115,6 +117,7 @@ from gateway.platforms.helpers import MessageDeduplicator
 from .activity import aux_activity, call_activity
 from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
 from .flowswitch import SwitchError, parse_link
+from . import flowswitch
 from . import vault
 from . import background
 from . import selfupdate
@@ -146,6 +149,10 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     PLAN_SCHEMA,
     build_plan,
     build_propose_action,
+    build_agent_card,
+    agent_card_result,
+    AGENT_CARD_ERRORS,
+    AGENT_CARD_SCHEMA,
     PROPOSE_ACTION_ERRORS,
     PROPOSE_ACTION_SCHEMA,
     RADAR_ERRORS,
@@ -256,7 +263,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.97"
+VERSION = "0.3.98"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1070,9 +1077,25 @@ class BrieflingAdapter(BasePlatformAdapter):
         ttl = cache_ttl()
         if ttl is not None:
             frame["plugin"]["cache_ttl"] = ttl
+        no_uns = self._flow_no_uns()
+        if no_uns:   # piloted by briefling by default, no switch by link (docs/design-flow.md § 14)
+            frame["plugin"]["no_uns"] = no_uns
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
+
+    def _flow_no_uns(self) -> List[str]:
+        """This machine's flow agents with no unstrikeable state file (`poll-<agent>.json` where `uns_state` or the
+        default place says): never ran on unstrikeable here, so briefling pilots them without a link (§ 14). An
+        unreadable path counts as present: the link stays the way in."""
+        out = set()
+        for fs in getattr(self, "_flow_spaces", None) or []:
+            try:
+                if not flowswitch.uns_state_path(fs.agent, fs.uns_state).exists():
+                    out.add(fs.agent)
+            except (SwitchError, OSError, ValueError):
+                continue
+        return sorted(out)[:20]
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -1285,7 +1308,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._offer_update(frame.get("release"))
         elif kind == "release":  # pushed by the hub once per deploy: no wait for the next connection
             self._offer_update(frame.get("release"))
-        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "action.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "mail.imported", "exchange.read",
+        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "action.result", "memory.result", "introspect.result", "agentcard.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "board.items", "board.written", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1811,6 +1834,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return memory_result(res)
+
+    async def agent_card(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """agentcard.write / agentcard.read: the agents' identity cards (the hub checks turn, membership and space)."""
+        try:
+            res = await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": AGENT_CARD_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return agent_card_result(frame, res)
 
     async def introspect(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
         """space.threads / thread.read / space.metrics: read only, the hub checks turn, membership and space."""
@@ -2598,6 +2631,18 @@ def propose_space_about_tool(args: Dict[str, Any], **_: Any) -> str:
     if len(text) > MAX_ABOUT:
         return tool_error(f"description too long ({len(text)} chars, max {MAX_ABOUT}): keep it short, it is read on every turn.")
     return _on_adapter("propose_space_about", thread, lambda a: a.propose_space_about(thread, text, str(args.get("why") or "")))
+
+
+def agent_card_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: agentcard.write / agentcard.read, waits for agentcard.result."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("agent_card")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_agent_card(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("agent_card", thread, lambda a: a.agent_card(thread, frame))
 
 
 def propose_action_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -3490,7 +3535,7 @@ def register(ctx) -> None:
         ctx.register_tool(name="memory_read", toolset="briefling", schema=MEMORY_READ_SCHEMA, handler=memory_read_tool,
                           description=MEMORY_READ_SCHEMA["description"], emoji="🧠")
         for schema, handler in ((SPACE_THREADS_SCHEMA, space_threads_tool), (THREAD_READ_SCHEMA, thread_read_tool),
-                                (SPACE_METRICS_SCHEMA, space_metrics_tool)):
+                                (SPACE_METRICS_SCHEMA, space_metrics_tool), (AGENT_CARD_SCHEMA, agent_card_tool)):
             ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
                               description=schema["description"], emoji="🔎")
         ctx.register_tool(name="mail_import", toolset="briefling", schema=MAIL_IMPORT_SCHEMA, handler=mail_import_tool,
