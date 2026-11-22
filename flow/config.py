@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ._yaml import YAMLError, safe_load
 
@@ -52,22 +52,38 @@ class Role:
     def labelled(self) -> bool:
         return bool(self.labels)
 
-    def named_label(self, agent: str) -> str | None:
+    def named_label(self, agent: str, present: Iterable[str] = ()) -> str | None:
+        """The label naming ``agent``: the one already in use (``present``: labels seen on the board) in either form
+        (``dev:kevin`` or GitLab's scoped ``dev::kevin``), else the template's form, scoped when the board already
+        uses scoped labels of that template."""
+        present = list(present)
         for t in self.labels:
             if "{agent}" in t:
-                return t.replace("{agent}", agent)
+                own = next((l for l in present if self.agent_of(l) == agent), None)
+                if own:
+                    return own
+                pre, post = t.split("{agent}", 1)
+                if pre.endswith(":") and not pre.endswith("::") and any(
+                        l.startswith(pre + ":") and self.agent_of(l) for l in present):
+                    pre += ":"
+                return pre + agent + post
         return None
 
     def pool_labels(self) -> list[str]:
         return [t for t in self.labels if "{agent}" not in t]
 
     def agent_of(self, label: str) -> str | None:
-        """'writer:kevin' -> 'kevin' for a named template 'writer:{agent}'."""
+        """'writer:kevin' -> 'kevin' for a named template 'writer:{agent}'; GitLab's scoped 'writer::kevin' too (a
+        template prefix ending in one ':' also matches it with two)."""
         for t in self.labels:
             if "{agent}" in t:
                 pre, post = t.split("{agent}", 1)
-                if label.startswith(pre) and label.endswith(post) and len(label) > len(pre) + len(post):
-                    return label[len(pre):len(label) - len(post)]
+                pres = [pre + ":", pre] if pre.endswith(":") and not pre.endswith("::") else [pre]
+                for p in pres:
+                    if label.startswith(p) and label.endswith(post) and len(label) > len(p) + len(post):
+                        name = label[len(p):len(label) - len(post)]
+                        if not name.startswith(":"):
+                            return name
         return None
 
 

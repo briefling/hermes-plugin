@@ -141,7 +141,7 @@ def events_for(agent: str, dept: Department, items: list[Item]) -> list[Event]:
                 if it.author_agent and not any(c.human for c in it.comments):
                     continue                              # created by an agent: waits for a human signal
 
-            auto = role.named_label(agent) if trusted_take(role, dept, it) else None
+            auto = role.named_label(agent, {l for x in items for l in x.labels}) if trusted_take(role, dept, it) else None
 
             def ev(trigger, disc, comment=None, it=it, rname=rname, auto=auto):
                 key = "%s|%s|%s|%s|%s" % (dept.name, it.ref, rname, trigger, disc)
