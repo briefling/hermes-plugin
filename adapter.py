@@ -115,7 +115,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import MessageDeduplicator
 
 from .activity import aux_activity, call_activity
-from .flowhost import FlowError, FlowHost, HubAnswer, load_settings
+from .flowhost import FlowError, FlowHost, FlowSpace, HubAnswer, load_settings
 from .flowswitch import SwitchError, parse_link
 from . import flowswitch
 from . import vault
@@ -263,7 +263,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.98"
+VERSION = "0.3.99"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1043,6 +1043,11 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._bg = background.Tracker()  # what the hub was last told of each thread's background work
         self._bg_task: Optional[asyncio.Task] = None
         self._flow_config_lock = asyncio.Lock()       # one bundle written at a time
+        # Flow with no settings file (docs/design-flow.md § 15): an agent the hub pilots by default gets a host made on
+        # `flow.pilot true`, its config from `flow.config`, its board through the hub (GitLab) or this machine's `gh`.
+        # BRIEFLING_FLOW_AUTO=0 = only the BRIEFLING_FLOW entries run a flow.
+        self._flow_auto = (_setting(extra, "flow_auto", "BRIEFLING_FLOW_AUTO") or "1").lower() not in ("0", "false", "no", "off")
+        self._flow_cfg_wait: Dict[str, Dict[str, Any]] = {}  # space -> last flow.config received before its host
         # Secrets (briefling/vault.py): key pair in memory only, new at every gateway start; None = feature off.
         self._secret_key = vault.new_key()
         # Agent web preview (preview.py): shares of this gateway (memory only) and their live peers.
@@ -1080,6 +1085,9 @@ class BrieflingAdapter(BasePlatformAdapter):
         no_uns = self._flow_no_uns()
         if no_uns:   # piloted by briefling by default, no switch by link (docs/design-flow.md § 14)
             frame["plugin"]["no_uns"] = no_uns
+        if self._flow_auto:   # any other agent of this instance with no unstrikeable state is piloted by default too (§ 15)
+            frame["plugin"]["flow_auto"] = True
+            frame["plugin"]["uns"] = self._flow_uns()
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
@@ -1096,6 +1104,21 @@ class BrieflingAdapter(BasePlatformAdapter):
             except (SwitchError, OSError, ValueError):
                 continue
         return sorted(out)[:20]
+
+    def _flow_uns(self) -> List[str]:
+        """Agents with an unstrikeable state file on this machine (§ 15): the `poll-<agent>.json` of the default place
+        (`$UNS_HOME/state/`, else `~/.unstrikeable/state/`), plus the BRIEFLING_FLOW agents not in `no_uns`. The hub
+        pilots by default the instance's other agents; these keep the switch by link."""
+        out = {fs.agent for fs in getattr(self, "_flow_spaces", None) or []} - set(self._flow_no_uns())
+        try:
+            base = flowswitch.uns_state_path("x", None).parent
+            for p in base.glob("poll-*.json") if base.is_dir() else []:
+                name = p.name[len("poll-"):-len(".json")]
+                if flowswitch.AGENT_RE.match(name):
+                    out.add(name)
+        except OSError:
+            pass
+        return sorted(out)[:50]
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -2280,13 +2303,32 @@ class BrieflingAdapter(BasePlatformAdapter):
 
     # -- flow ------------------------------------------------------------------
 
-    def _start_flow(self) -> None:
+    @staticmethod
+    def _flow_state_dir() -> Path:
         from hermes_constants import get_hermes_home
-        state_dir = Path(get_hermes_home()) / "briefling-flow"
+        return Path(get_hermes_home()) / "briefling-flow"
+
+    def _start_flow(self) -> None:
+        state_dir = self._flow_state_dir()
         for fs in self._flow_spaces:
             self._flow[fs.space] = FlowHost(fs, state_dir, self._flow_request, self._flow_inject(fs.space))
         logger.info("[%s] flow on for %s (every %.0f min)", self.name, ",".join(self._flow), self._flow_poll_min)
         self._flow_loop_task = asyncio.create_task(self._flow_loop())
+
+    async def _flow_auto_host(self, space: str, agent: str) -> Optional["FlowHost"]:
+        """§ 15: the hub pilots `agent` in `space` by default and this machine has no BRIEFLING_FLOW entry there: a host
+        with no local config nor identity (config = the hub's `flow.config`, GitLab board = the hub, GitHub = `gh`)."""
+        if not self._flow_auto or not (ID_RE.match(space) and flowswitch.AGENT_RE.match(agent)):
+            return None
+        host = FlowHost(FlowSpace(space=space, agent=agent), self._flow_state_dir(), self._flow_request, self._flow_inject(space))
+        self._flow[space] = host
+        logger.info("[%s] flow on for %s/%s, piloted by briefling by default (no BRIEFLING_FLOW entry)", self.name, space, agent)
+        if self._flow_loop_task is None or self._flow_loop_task.done():
+            self._flow_loop_task = asyncio.create_task(self._flow_loop())
+        waiting = self._flow_cfg_wait.pop(space, None)
+        if waiting is not None:   # the hub sends the config before flow.pilot at a connection
+            await self._on_flow_config(waiting)
+        return host
 
     async def _flow_loop(self) -> None:
         """Timer: each host ticks every `poll_min` while the hub is reachable (degraded mode is a later slice)."""
@@ -2361,6 +2403,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         after a switch write the engine state back to unstrikeable's file (« Back to unstrikeable »)."""
         host = self._flow.get(str(frame.get("space") or ""))
         piloted = frame.get("piloted")
+        if host is None and piloted is True and isinstance(frame.get("space"), str) and isinstance(frame.get("agent"), str):
+            host = await self._flow_auto_host(frame["space"], frame["agent"])
         if host is None or frame.get("agent") != host.fs.agent or not isinstance(piloted, bool):
             return
         was, host.piloted = host.piloted, piloted
@@ -2398,7 +2442,14 @@ class BrieflingAdapter(BasePlatformAdapter):
         `flow.config.status`. A space this machine runs no flow for is ignored: the editor then shows no answer."""
         host = self._flow.get(str(frame.get("space") or ""))
         version, sha = frame.get("version"), frame.get("sha")
-        if host is None or not isinstance(version, int) or isinstance(version, bool) or not isinstance(sha, str):
+        if not isinstance(version, int) or isinstance(version, bool) or not isinstance(sha, str):
+            return
+        if host is None:   # no host yet: kept for the one `flow.pilot true` may make (§ 15), the latest only
+            space = frame.get("space")
+            if self._flow_auto and isinstance(space, str) and ID_RE.match(space):
+                self._flow_cfg_wait = {**{k: v for k, v in self._flow_cfg_wait.items() if k != space}, space: frame}
+                while len(self._flow_cfg_wait) > 20:
+                    self._flow_cfg_wait.pop(next(iter(self._flow_cfg_wait)))
             return
         async with self._flow_config_lock:
             try:
