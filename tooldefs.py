@@ -58,7 +58,9 @@ CARD_SHOWN = {
                          "the list and who it is for). It then shows in the space's Reminders, with a notification when due."),
     "ask_choices": (f"Card {_AFTER_TEXT}. End your turn now (in a thread: turn_outcome waiting, action 'answer the "
                     "card'); do not repeat the questions in text. The human's choices come back as your next message, "
-                    "one line « label → choice » per point; a message they write instead is their answer."),
+                    "one line « label → choice » per point; a message they write instead is their answer. A poll: "
+                    "the agents you named are woken once your turn ends; the leads' messages do not close it, only "
+                    "a lead's closure, which comes with the votes."),
     "propose_plan": (f"Card {_AFTER_TEXT}; nothing starts until a trusted human clicks Launch the plan. Then the steps "
                      "run in order: each step is a thread, and ending it with turn_outcome done opens the next one "
                      "(in a board-driven space, each step becomes an issue blocked by the previous one)."),
@@ -154,6 +156,8 @@ CONTEXT_TOTAL_MAX = 12000
 
 
 ASK_ITEMS_MAX = 5  # protocol/frames.ts ASK_* (« To decide » card)
+POLL_VOTERS_MAX = 5  # protocol/poll.ts POLL_VOTERS_MAX
+AGENT_NAME_RE = re.compile(r"@?[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
 ASK_OPTIONS_MIN, ASK_OPTIONS_MAX = 2, 4
 ASK_LABEL_MAX, ASK_ITEM_Q_MAX, ASK_OPTION_MAX, ASK_TEXT_MAX = 60, 500, 200, 2000
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
@@ -166,6 +170,9 @@ ASK_ERRORS = {
     "bad_frame": (f"Invalid card: 1 to {ASK_ITEMS_MAX} questions, each with a one-line label (max {ASK_LABEL_MAX}), "
                   f"a question (max {ASK_ITEM_Q_MAX}) and {ASK_OPTIONS_MIN} to {ASK_OPTIONS_MAX} one-line choices "
                   f"(max {ASK_OPTION_MAX} each); intro max {ASK_TEXT_MAX}."),
+    "not_thread": "A poll card is for a work thread only: in a Lounge topic, use the plain card (mode decide).",
+    "bad_voters": (f"voters: at most {POLL_VOTERS_MAX} names of agents of this space (space_threads or the space "
+                   "description lists them), never yourself."),
 }
 
 
@@ -195,7 +202,65 @@ def build_ask_choices(args: Dict[str, Any]) -> "tuple[Dict[str, Any] | None, str
     intro = str(args.get("intro") or "").strip()
     if len(intro) > ASK_TEXT_MAX:
         return None, f"intro too long ({len(intro)} chars, max {ASK_TEXT_MAX})."
-    return {"type": "ask.choices", "text": intro, "items": items}, None
+    mode = args.get("mode") or "decide"
+    if mode not in ("decide", "poll"):
+        return None, "mode is 'decide' (default) or 'poll'."
+    voters = args.get("voters")
+    if mode == "decide":
+        if voters:
+            return None, "voters only go with mode 'poll'."
+        return {"type": "ask.choices", "text": intro, "items": items}, None
+    if voters is None:
+        voters = []
+    if (not isinstance(voters, list) or len(voters) > POLL_VOTERS_MAX
+            or any(not isinstance(v, str) or not AGENT_NAME_RE.fullmatch(v.strip()) for v in voters)):
+        return None, f"voters: at most {POLL_VOTERS_MAX} agent names of this space, e.g. ['reviewer']."
+    return {"type": "ask.choices", "text": intro, "items": items, "poll": {"voters": [v.strip() for v in voters]}}, None
+
+
+POLL_VOTE_ERRORS = {
+    "no_turn": "Only during your turn in this conversation (the hub woke you to vote).",
+    "not_voter": "The card's author did not name you as a voter: give your opinion in your message instead.",
+    "closed": "The card is closed (a lead closed it, or a newer card replaced it): nothing to vote any more.",
+    "bad_frame": "Invalid vote: ask_id of a poll card of this conversation, and one choice per point, in order.",
+    "forbidden": "Not allowed for this instance.",
+}
+
+
+def build_poll_vote(args: Dict[str, Any]) -> "tuple[Dict[str, Any] | None, str | None]":
+    """poll_vote arguments -> the `poll.vote` frame (without thread and client_id), or the refusal text."""
+    ask_id = str(args.get("ask_id") or "").strip()
+    if not ID_RE.match(ask_id):
+        return None, "ask_id is required: the card's id, given in the message that woke you."
+    picks = args.get("choices")
+    if (not isinstance(picks, list) or not 1 <= len(picks) <= ASK_ITEMS_MAX
+            or any(isinstance(p, bool) or not isinstance(p, (str, int)) or (isinstance(p, str) and not p.strip()) for p in picks)):
+        return None, "choices is required: one per point of the card, in order (the choice's text, or its index from 0)."
+    return {"type": "poll.vote", "ask_id": ask_id, "picks": [p.strip() if isinstance(p, str) else p for p in picks]}, None
+
+
+POLL_VOTED = ("Vote recorded on the card, with your name and an agent badge. Give your reason in a line or two, then "
+              "end your turn: a lead closes the card.")
+
+
+POLL_VOTE_SCHEMA = {
+    "name": "poll_vote",
+    "description": (
+        "Vote on a poll card you were named for. One choice per point of the card (a « To decide » card in mode "
+        "poll), in order. Only when the hub woke you for it, during that turn; a second call replaces your vote while "
+        "the card is open. Your vote is an opinion shown to the humans with your name and an agent badge, never a go: a "
+        "lead closes the card. Give your reason in a line or two in your reply."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ask_id": {"type": "string", "description": "The card's id, given in the message that woke you."},
+            "choices": {"type": "array", "minItems": 1, "maxItems": ASK_ITEMS_MAX, "items": {"type": "string"},
+                        "description": "One per point, in the card's order: the text of the choice you pick."},
+        },
+        "required": ["ask_id", "choices"],
+    },
+}
 
 
 ASK_CHOICES_SCHEMA = {
@@ -206,7 +271,10 @@ ASK_CHOICES_SCHEMA = {
         "choose between options (scope, behaviour, who may do what); not to approve a command, nor for a question "
         "without choices. One call per turn, after your text (findings, why it matters); then end your turn: the "
         "answer (a choice, 'Other' or a message, which closes the card) comes as your next message. A new card "
-        "replaces an unanswered one."
+        "replaces an unanswered one. mode 'poll' (work threads only): the same card as an opinion poll, where every "
+        "lead of the space and the agents you name in voters vote, live, and a lead closes it with the final choice "
+        "per point; that closure, with the votes, is your next message (an agent's vote is never a go). Name only "
+        "the agents whose opinion matters: each one is woken once and costs a turn."
     ),
     "parameters": {
         "type": "object",
@@ -226,6 +294,10 @@ ASK_CHOICES_SCHEMA = {
                     "required": ["label", "question", "choices"],
                 },
             },
+            "mode": {"type": "string", "enum": ["decide", "poll"],
+                     "description": "'decide' (default): a lead answers. 'poll': leads and the named agents vote, a lead closes it."},
+            "voters": {"type": "array", "maxItems": POLL_VOTERS_MAX, "items": {"type": "string"},
+                       "description": "mode 'poll' only: the agents of this space asked to vote (names, max 5, never yourself); leads always vote."},
         },
         "required": ["questions"],
     },

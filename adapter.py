@@ -118,6 +118,7 @@ from . import preview as pv
 from . import browserthumb as bthumb
 from . import pwthumb
 from . import projects as proj
+from . import approvals as apv
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
@@ -194,6 +195,10 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     ASK_CHOICES_SCHEMA,
     ASK_ERRORS,
     build_ask_choices,
+    POLL_VOTE_SCHEMA,
+    POLL_VOTE_ERRORS,
+    POLL_VOTED,
+    build_poll_vote,
     ISSUE_SCHEMA,
     ELEVATION_SCHEMA,
     ELEVATION_ERRORS,
@@ -241,7 +246,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.93"
+VERSION = "0.3.94"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -978,6 +983,8 @@ class BrieflingAdapter(BasePlatformAdapter):
         # BRIEFLING_ALLOWED_FROM=hub: the allowlist is the hub's, per space (space -> Cognito subs), empty until received.
         self._from_hub = _setting(extra, "allowed_from", "BRIEFLING_ALLOWED_FROM").lower() == "hub"
         self._hub_allowed: Dict[str, frozenset] = {}
+        # space -> agent -> {mode, by, users}: the space's command-approval setting (approvals.py), pushed by the hub
+        self._approval_modes: Dict[str, Dict[str, Dict[str, Any]]] = {}
         if self._from_hub:
             # Hermes then asks this adapter (``_is_dm_allowed``) instead of an env list, as long as none is set.
             self._dm_policy = "allowlist"
@@ -1248,12 +1255,16 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._previews.close(frame.get("session"))
         elif kind == "allowed":
             self._on_allowed(frame.get("space"), frame.get("users"))
+            if isinstance(frame.get("space"), str) and "approvals" in frame:
+                self._approval_modes[frame["space"]] = apv.parse(frame.get("approvals"))
         elif kind == "subscribed":
             self._hub_spaces = {s for s in frame.get("spaces") or [] if isinstance(s, str)}
             if isinstance(frame.get("allowed"), dict):  # a new connection: the hub's lists replace the old ones
                 self._hub_allowed = {}
                 for space, users in frame["allowed"].items():
                     self._on_allowed(space, users)
+            if isinstance(frame.get("approvals"), dict):
+                self._approval_modes = {s: apv.parse(v) for s, v in frame["approvals"].items() if isinstance(s, str)}
             for host in list(self._flow.values()):   # a new connection: nobody pilots until the hub's flow.pilot says so
                 host.piloted = False
             if frame.get("denied"):
@@ -1638,6 +1649,16 @@ class BrieflingAdapter(BasePlatformAdapter):
             return {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
         return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["ask_choices"]}
 
+    async def poll_vote(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """poll.vote: this agent's vote on a poll card it was named to vote on (frame from build_poll_vote)."""
+        try:
+            await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": POLL_VOTE_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "detail": POLL_VOTED}
+
     async def propose_plan(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
         """Show a "Launch this plan?" card in this conversation (frame from build_plan). Nothing starts until a click."""
         try:
@@ -2002,6 +2023,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         ask_id = new_id()
         labels = {self._APPROVAL_LABELS[c]: c for _, c, _ in prompt.actions if c in self._APPROVAL_LABELS}
         q = approval_question(prompt.command, prompt.description)
+        # The space's setting for this agent (approvals.py): an auto mode answers now, the card is posted answered.
+        space, agent = self._thread_space.get(prompt.chat_id, ""), self._thread_agent.get(prompt.chat_id, "")
+        mode = apv.mode_of(self._approval_modes, space, agent) if self._from_hub else apv.DEFAULT
+        auto = await apv.decide(mode, prompt.command, prompt.description, bool(getattr(prompt, "smart_denied", False)))
+        if auto:
+            from tools.approval import resolve_gateway_approval
+            resolve_gateway_approval(prompt.session_key, auto)
+            logger.info("[%s] command %s by the space setting (%s)", self.name, "approved" if auto == "once" else "denied", mode)
+            ok = await self._send_frame({"type": "ask", "thread": prompt.chat_id, "ask_id": ask_id, "q": q, "options": list(labels), "auto": auto})
+            return SendResult(success=True, message_id=ask_id if ok else None)
         self._approvals[ask_id] = (prompt.chat_id, prompt.session_key, labels)
         ok = await self._send_frame({"type": "ask", "thread": prompt.chat_id, "ask_id": ask_id, "q": q, "options": list(labels)})
         if not ok:
@@ -2011,7 +2042,10 @@ class BrieflingAdapter(BasePlatformAdapter):
     async def _on_approval_answer(self, thread: str, ask_id: str, author: str, text: str) -> None:
         card_thread, session_key, labels = self._approvals[ask_id]
         choice = labels.get(text.strip())
-        allowed = self.allows(author, self._thread_space.get(thread, ""))
+        space = self._thread_space.get(thread, "")
+        # Hub mode: the approvers the space's setting names for this agent (leads, contributors too in `contributor`).
+        users = apv.approvers(self._approval_modes, space, self._thread_agent.get(thread, "")) if self._from_hub else None
+        allowed = author in users if users is not None else self.allows(author, space)
         if thread != card_thread or not allowed or not choice:
             logger.warning("[%s] approval answer ignored (thread match %s, author allowed %s, known label %s)",
                            self.name, thread == card_thread, allowed, bool(choice))
@@ -2511,6 +2545,18 @@ def ask_choices_tool(args: Dict[str, Any], task_id: str = "", **_: Any) -> str:
     if bad:
         return tool_error(bad)
     return _on_adapter("ask_choices", thread, lambda a: a.ask_choices(thread, frame), any_adapter=True)
+
+
+def poll_vote_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: poll.vote (the hub checks the turn, that the card's author named this agent and that it is open)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("poll_vote")
+    if err:
+        return tool_error(err)
+    frame, bad = build_poll_vote(args)
+    if bad:
+        return tool_error(bad)
+    return _on_adapter("poll_vote", thread, lambda a: a.poll_vote(thread, frame))
 
 
 def propose_plan_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -3383,6 +3429,8 @@ def register(ctx) -> None:
                           description=ELEVATION_SCHEMA["description"], emoji="🔐")
         ctx.register_tool(name="ask_choices", toolset="briefling", schema=ASK_CHOICES_SCHEMA, handler=ask_choices_tool,
                           description=ASK_CHOICES_SCHEMA["description"], emoji="🔀")
+        ctx.register_tool(name="poll_vote", toolset="briefling", schema=POLL_VOTE_SCHEMA, handler=poll_vote_tool,
+                          description=POLL_VOTE_SCHEMA["description"], emoji="🗳️")
         ctx.register_tool(name="propose_plan", toolset="briefling", schema=PLAN_SCHEMA, handler=propose_plan_tool,
                           description=PLAN_SCHEMA["description"], emoji="🗺️")
         ctx.register_tool(name="propose_space_about", toolset="briefling", schema=ABOUT_SCHEMA, handler=propose_space_about_tool,
