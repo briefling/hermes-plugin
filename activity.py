@@ -25,7 +25,7 @@ _SHELL_TOOLS = frozenset({"terminal"})
 # task lists, schedules, skills (outside the background review, which has its own category), starting sub-agents.
 _COORDINATION_TOOLS = frozenset({
     "delegate_task",
-    "acquire_resource", "release_resource", "pushed_commits", "flow_switch",
+    "acquire_action", "release_action", "acquire_resource", "release_resource", "pushed_commits", "flow_switch",
     "board_comment", "board_label", "board_move", "board_set", "board_status",
     "memory_propose", "memory_review", "memory_compact", "memory_tag", "memory_tag_merge", "memory_tag_threads", "memory",
     "process_manage", "process", "todo_list", "todo", "cronjob_manage", "cronjob", "skill_manage",

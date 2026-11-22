@@ -28,11 +28,13 @@ Lifecycle hooks map to the hub protocol (protocol/frames.ts in the briefling rep
 - tool ``turn_outcome`` -> ``thread.outcome``: in a thread, the agent says how its turn ends: ``done``, or
   ``waiting`` + the action it needs from the human ("/restart the gateway"). Same rule: typed frame,
   never guessed from the reply text. Only a human clears a wait (reply in the thread, or "Done").
-- tool ``acquire_resource`` -> ``resource.acquire``, answered by ``resource.result``: right before using a shared
-  resource of the space (stack, emulator, gateway). Granted: the thread holds it until ``release_resource`` or the
+- tool ``acquire_action`` -> ``action.acquire``, answered by ``action.result``: right before doing an action of the
+  space (deploy a stack, publish a release, the emulator). Granted: the thread holds it until ``release_action`` or the
   end of the turn. Queued: the hub parks the thread; the agent ends its turn without ``turn_outcome`` and the hub
-  resumes the thread with a new message once the resource is granted to it.
-- tool ``release_resource`` -> ``resource.release`` (``ack``): done with the resource, the next parked thread gets it.
+  resumes the thread with a new message once the action is granted to it. A guest is never queued (busy). Refused
+  ``not_allowed`` (``detail`` = the allowed agents) or ``no_go`` (turn woken by another agent's mention).
+- tool ``release_action`` -> ``action.release`` (``ack``): done with the action, the next parked thread gets it.
+  ``acquire_resource`` / ``release_resource`` stay as aliases of both (same frames).
 - tools ``space_threads`` / ``thread_read`` / ``space_metrics`` -> ``space.threads`` / ``thread.read`` / ``space.metrics``
   (``introspect.result``): read only, conversations of a space the agent serves (same gates as memory_search, hub side).
 - tools ``memory_search`` / ``memory_read`` -> ``memory.search`` / ``memory.read`` (``memory.result``): published
@@ -159,6 +161,8 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     OUTCOME_ERRORS,
     clean_settled_leads,
     RESOURCE_ERRORS,
+    action_refused,
+    action_result,
     ABOUT_ERRORS,
     APPLET_ERRORS,
     REMINDER_ERRORS,
@@ -211,9 +215,10 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     clean_commits,
     clean_sources,
     clean_thread_tags,
-    RESOURCE_PARAMS,
     ACQUIRE_SCHEMA,
     RELEASE_SCHEMA,
+    ACQUIRE_ALIAS_SCHEMA,
+    RELEASE_ALIAS_SCHEMA,
     PUSHED_SCHEMA,
     MEMORY_SPACE_PARAM,
     MEMORY_SEARCH_SCHEMA,
@@ -246,7 +251,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.95"
+VERSION = "0.3.96"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -327,7 +332,7 @@ FLOW_WAKE_MIN_S = 60         # flow.wake: ignored less than this after the host'
 FLOW_USER = "briefling-flow"
 FLOW_PREAMBLE = (
     "[briefling] Board task, started by the flow (not by a human request). Work it with the board_* tools. In this "
-    "turn propose_issue, turn_outcome, acquire_resource, pushed_commits and the memory tools are refused: the board "
+    "turn propose_issue, turn_outcome, acquire_action, pushed_commits and the memory tools are refused: the board "
     "status says how the task ends. A human may answer in this thread after your turn.\n\n")
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -819,9 +824,10 @@ def give_back_usage(thread: str, u: Dict[str, Any]) -> None:
 
 
 class HubRefused(Exception):
-    def __init__(self, code: str):
+    def __init__(self, code: str, detail: str = ""):
         super().__init__(code)
         self.code = code
+        self.detail = detail
 
 
 # Voice note recorded with the composer's mic button: the client names it `audio-YYYY-MM-DD-HHMM.<ext>` (recName in
@@ -1274,7 +1280,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._offer_update(frame.get("release"))
         elif kind == "release":  # pushed by the hub once per deploy: no wait for the next connection
             self._offer_update(frame.get("release"))
-        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "mail.imported", "exchange.read",
+        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "action.result", "memory.result", "introspect.result", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1282,7 +1288,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         elif kind == "error":
             fut = self._waiting.pop(str(frame.get("ref")), None)
             if fut and not fut.done():
-                fut.set_exception(HubRefused(str(frame.get("code") or "error")))
+                fut.set_exception(HubRefused(str(frame.get("code") or "error"), str(frame.get("detail") or "")[:400]))
             logger.warning("[%s] hub error: %s", self.name, frame.get("code"))
 
     async def _on_deliver(self, frame: Dict[str, Any]) -> None:
@@ -1771,24 +1777,15 @@ class BrieflingAdapter(BasePlatformAdapter):
             return {"ok": True, "detail": "Shown in the thread: the human sees what you wait for." + posted}
         return {"ok": True, "detail": "Thread marked as finished." + posted, "memory": MEMORY_NUDGE}
 
-    async def acquire_resource(self, thread: str, resource: str) -> Dict[str, Any]:
-        """Take a shared resource of the space (answer `resource.result`: granted, or queued = thread parked)."""
+    async def acquire_action(self, thread: str, action: str) -> Dict[str, Any]:
+        """Take an action of the space (answer `action.result`: granted, queued = thread parked, or busy for a guest)."""
         try:
-            res = await self._request({"type": "resource.acquire", "thread": thread, "resource": resource})
+            res = await self._request({"type": "action.acquire", "thread": thread, "action": action})
         except HubRefused as e:
-            return {"ok": False, "error": e.code, "detail": RESOURCE_ERRORS.get(e.code, e.code)}
+            return action_refused(e.code, e.detail)
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
-        if res.get("granted") is True:
-            return {"ok": True, "granted": True,
-                    "detail": f"You hold {resource} until you call release_resource or your turn ends. Use it now."}
-        holder = str(res.get("holder") or "another thread")[:120]
-        position = res.get("position") if isinstance(res.get("position"), int) else None
-        where = f" (you are #{position} in the queue)" if position else ""
-        return {"ok": True, "granted": False, "holder": holder, "position": position, "detail": (
-            f'{resource} is in use by thread "{holder}"{where}. Do NOT use it. Stop here: end your turn now with a '
-            f"one-line message saying what you wait for, and do NOT call turn_outcome. The hub resumes this thread "
-            f"with a new message when {resource} is yours.")}
+        return action_result(action, res)
 
     async def memory_lookup(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
         """memory.search / memory.read: entries as cited data (the hub checks turn, membership and status)."""
@@ -1911,15 +1908,15 @@ class BrieflingAdapter(BasePlatformAdapter):
                 "detail": ("Waiting for a human: once approved, those entries are removed (they stay restorable)." if drop else
                            "Waiting for a human: once approved, it replaces those entries (they stay restorable).")}
 
-    async def release_resource(self, thread: str, resource: str) -> Dict[str, Any]:
-        """Free a shared resource (no effect hub-side if this thread does not hold it)."""
+    async def release_action(self, thread: str, action: str) -> Dict[str, Any]:
+        """Free an action (no effect hub-side if this agent does not hold it in this thread)."""
         try:
-            await self._request({"type": "resource.release", "thread": thread, "resource": resource})
+            await self._request({"type": "action.release", "thread": thread, "action": action})
         except HubRefused as e:
-            return {"ok": False, "error": e.code, "detail": RESOURCE_ERRORS.get(e.code, e.code)}
+            return action_refused(e.code, e.detail)
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
-        return {"ok": True, "detail": f"{resource} released."}
+        return {"ok": True, "detail": f"{action} released."}
 
     async def pushed_commits(self, thread: str, commits: List[Dict[str, str]]) -> Dict[str, Any]:
         """Declare pushed commits: the hub follows their CI (display only)."""
@@ -2670,34 +2667,35 @@ def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, outcome, action, summary, resume is True, tags, text, settled))
 
 
-def _resource_args(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """(thread, resource, None) or (None, None, error message): session and name checked before any frame."""
+def _action_args(tool: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """(thread, action, None) or (None, None, error message): session and name checked before any frame.
+    `action`, or `resource` for the old tool names."""
     thread, err = _session_thread(tool)
     if err:
         return None, None, err
-    resource = str(args.get("resource") or "").strip()
-    if not RESOURCE_RE.fullmatch(resource):
-        return None, None, (f"invalid resource name {resource[:60]!r}: use a name listed in the conversation context "
-                            "(e.g. 'emulator', 'stack:briefling-dev').")
-    return thread, resource, None
+    action = str(args.get("action") or args.get("resource") or "").strip()
+    if not RESOURCE_RE.fullmatch(action):
+        return None, None, (f"invalid action name {action[:60]!r}: use a name listed in the conversation context "
+                            "(e.g. 'emulator', 'stack:briefling-prod').")
+    return thread, action, None
 
 
-def acquire_resource_tool(args: Dict[str, Any], **_: Any) -> str:
-    """Tool handler: resource.acquire, waits for resource.result."""
+def acquire_action_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: action.acquire, waits for action.result (also the old acquire_resource)."""
     from tools.registry import tool_error
-    thread, resource, err = _resource_args("acquire_resource", args)
+    thread, action, err = _action_args("acquire_action", args)
     if err:
         return tool_error(err)
-    return _on_adapter("acquire_resource", thread, lambda a: a.acquire_resource(thread, resource))
+    return _on_adapter("acquire_action", thread, lambda a: a.acquire_action(thread, action))
 
 
-def release_resource_tool(args: Dict[str, Any], **_: Any) -> str:
-    """Tool handler: resource.release, waits for the ack."""
+def release_action_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: action.release, waits for the ack (also the old release_resource)."""
     from tools.registry import tool_error
-    thread, resource, err = _resource_args("release_resource", args)
+    thread, action, err = _action_args("release_action", args)
     if err:
         return tool_error(err)
-    return _on_adapter("release_resource", thread, lambda a: a.release_resource(thread, resource))
+    return _on_adapter("release_action", thread, lambda a: a.release_action(thread, action))
 
 
 def pushed_commits_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -3359,7 +3357,7 @@ def _env_enablement() -> Optional[dict]:
 # Turn tools: called on most turns, so their schema stays in the model's tool list instead of behind Tool Search
 # (Hermes defers every plugin tool and has no per-tool setting). Measured on 14 days of briefling sessions: called
 # blind through tool_call, they made most of the argument rejections. Their schemas weigh ~11 k chars in all.
-TURN_TOOLS = frozenset({"turn_outcome", "pushed_commits", "acquire_resource", "release_resource", "ask_choices",
+TURN_TOOLS = frozenset({"turn_outcome", "pushed_commits", "acquire_action", "release_action", "ask_choices",
                         "memory_propose", "thread_read"})
 
 
@@ -3442,10 +3440,14 @@ def register(ctx) -> None:
                           description=TOPIC_TITLE_SCHEMA["description"], emoji="🏷️")
         ctx.register_tool(name="turn_outcome", toolset="briefling", schema=OUTCOME_SCHEMA, handler=turn_outcome_tool,
                           description=OUTCOME_SCHEMA["description"], emoji="✅")
-        ctx.register_tool(name="acquire_resource", toolset="briefling", schema=ACQUIRE_SCHEMA, handler=acquire_resource_tool,
+        ctx.register_tool(name="acquire_action", toolset="briefling", schema=ACQUIRE_SCHEMA, handler=acquire_action_tool,
                           description=ACQUIRE_SCHEMA["description"], emoji="🔒")
-        ctx.register_tool(name="release_resource", toolset="briefling", schema=RELEASE_SCHEMA, handler=release_resource_tool,
+        ctx.register_tool(name="release_action", toolset="briefling", schema=RELEASE_SCHEMA, handler=release_action_tool,
                           description=RELEASE_SCHEMA["description"], emoji="🔓")
+        ctx.register_tool(name="acquire_resource", toolset="briefling", schema=ACQUIRE_ALIAS_SCHEMA, handler=acquire_action_tool,
+                          description=ACQUIRE_ALIAS_SCHEMA["description"], emoji="🔒")
+        ctx.register_tool(name="release_resource", toolset="briefling", schema=RELEASE_ALIAS_SCHEMA, handler=release_action_tool,
+                          description=RELEASE_ALIAS_SCHEMA["description"], emoji="🔓")
         ctx.register_tool(name="pushed_commits", toolset="briefling", schema=PUSHED_SCHEMA, handler=pushed_commits_tool,
                           description=PUSHED_SCHEMA["description"], emoji="🚦")
         ctx.register_tool(name="preview_share", toolset="briefling", schema=PREVIEW_SHARE_SCHEMA, handler=preview_share_tool,
