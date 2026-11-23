@@ -118,7 +118,8 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import MessageDeduplicator
 
 from .activity import aux_activity, call_activity
-from .flowhost import FlowError, FlowHost, FlowSpace, HubAnswer, load_settings
+from .flowhost import FlowError, FlowHost, FlowSpace, HubAnswer  # noqa: F401 (FlowSpace: tests read it from here)
+from .flowrunner import FLOW_TIMER_S, FLOW_WAKE_MIN_S, FlowGateway, FlowRunner  # noqa: F401
 from .flowswitch import SwitchError, parse_link
 from . import flowswitch
 from . import vault
@@ -130,6 +131,8 @@ from . import pwthumb
 from . import projects as proj
 from . import approvals as apv
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
+    BOARD_REF, BOARD_STATUS_SCHEMA, BOARD_COMMENT_SCHEMA, BOARD_MOVE_SCHEMA, BOARD_SET_SCHEMA, BOARD_LABEL_SCHEMA,
+    FLOW_SWITCH_SCHEMA, FLOW_PREAMBLE,
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
     clean_context,
@@ -272,7 +275,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.104"
+VERSION = "0.3.105"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -347,14 +350,8 @@ RECONNECT_BACKOFF = [1, 2, 5, 10, 30, 60]
 PING_EVERY_S = 300            # API Gateway closes idle connections after 10 min
 RECYCLE_AFTER_S = 110 * 60    # ... and every connection after 2 h: reconnect before
 TOKEN_MARGIN_S = 120
-FLOW_TIMER_S = 30            # flow: how often the timer checks whether a host is due (poll_min)
 FLOW_MSG_PREFIX = "flow-"    # message id of a task turn's internal event
-FLOW_WAKE_MIN_S = 60         # flow.wake: ignored less than this after the host's last tick (docs/design-flow.md § 4.4)
 FLOW_USER = "briefling-flow"
-FLOW_PREAMBLE = (
-    "[briefling] Board task, started by the flow (not by a human request). Work it with the board_* tools. In this "
-    "turn propose_issue, turn_outcome, acquire_action, pushed_commits and the memory tools are refused: the board "
-    "status says how the task ends. A human may answer in this thread after your turn.\n\n")
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
@@ -1043,20 +1040,18 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._stop_asked: Dict[str, str] = {}  # thread -> who asked the hub to stop its running turn
         self._stop_ids: set = set()  # message ids of the synthetic /stop events: the gateway's reply to them is dropped
         self._stop_tasks: set = set()
-        # Flow (docs/design-flow.md): board engine per (space, agent) listed in the settings file; ticks every poll_min.
-        self._flow_poll_min, self._flow_spaces = load_settings(_setting(extra, "flow", "BRIEFLING_FLOW"))
-        self._flow: Dict[str, FlowHost] = {}          # space -> host
-        self._flow_turns: Dict[str, FlowHost] = {}    # thread -> host whose task turn runs there
-        self._flow_ended: Dict[str, int] = {}         # thread -> end (s) of its last turn: the task's sign of life
-        self._flow_loop_task: Optional[asyncio.Task] = None
         self._bg = background.Tracker()  # what the hub was last told of each thread's background work
         self._bg_task: Optional[asyncio.Task] = None
-        self._flow_config_lock = asyncio.Lock()       # one bundle written at a time
-        # Flow with no settings file (docs/design-flow.md § 15): an agent the hub pilots by default gets a host made on
-        # `flow.pilot true`, its config from `flow.config`, its board through the hub (GitLab) or this machine's `gh`.
-        # BRIEFLING_FLOW_AUTO=0 = only the BRIEFLING_FLOW entries run a flow.
-        self._flow_auto = (_setting(extra, "flow_auto", "BRIEFLING_FLOW_AUTO") or "1").lower() not in ("0", "false", "no", "off")
-        self._flow_cfg_wait: Dict[str, Dict[str, Any]] = {}  # space -> last flow.config received before its host
+        # Flow (docs/design-flow.md, flowrunner.py): board engine per (space, agent), from the settings file
+        # (BRIEFLING_FLOW) or, with no entry (§ 15), made on the hub's `flow.pilot true` for an agent it pilots by
+        # default; BRIEFLING_FLOW_AUTO=0 = only the settings file's entries. The gateway's side is the FlowGateway port.
+        self._flow_runner = FlowRunner(
+            FlowGateway(send=self._send_frame, request=self._flow_request, inject=self._flow_gateway_inject,
+                        turn_running=lambda t: t in self._turns, turn_since=lambda t: self._turn_since.get(t, 0) // 1000,
+                        connected=self._opened, running=lambda: self._running),
+            _setting(extra, "flow", "BRIEFLING_FLOW"),
+            (_setting(extra, "flow_auto", "BRIEFLING_FLOW_AUTO") or "1").lower() not in ("0", "false", "no", "off"),
+            self._flow_state_dir, name=self.name)
         # Secrets (briefling/vault.py): key pair in memory only, new at every gateway start; None = feature off.
         self._secret_key = vault.new_key()
         # Agent web preview (preview.py): shares of this gateway (memory only) and their live peers.
@@ -1091,43 +1086,42 @@ class BrieflingAdapter(BasePlatformAdapter):
         ttl = cache_ttl()
         if ttl is not None:
             frame["plugin"]["cache_ttl"] = ttl
-        no_uns = self._flow_no_uns()
+        no_uns = self._flow_runner.no_uns()
         if no_uns:   # piloted by briefling by default, no switch by link (docs/design-flow.md § 14)
             frame["plugin"]["no_uns"] = no_uns
         if self._flow_auto:   # any other agent of this instance with no unstrikeable state is piloted by default too (§ 15)
             frame["plugin"]["flow_auto"] = True
-            frame["plugin"]["uns"] = self._flow_uns()
+            frame["plugin"]["uns"] = self._flow_runner.uns()
         if self._spaces != ["*"]:
             frame["spaces"] = self._spaces
         return frame
 
+    # The flow's state lives in the runner; these names stay for the tests and the tools.
+    @property
+    def _flow(self) -> Dict[str, FlowHost]:
+        return self._flow_runner.hosts
+
+    @property
+    def _flow_spaces(self) -> List[FlowSpace]:
+        return self._flow_runner.spaces
+
+    @_flow_spaces.setter
+    def _flow_spaces(self, spaces: List[FlowSpace]) -> None:
+        self._flow_runner.spaces = spaces
+
+    @property
+    def _flow_auto(self) -> bool:
+        return self._flow_runner.auto
+
+    @_flow_auto.setter
+    def _flow_auto(self, on: bool) -> None:
+        self._flow_runner.auto = on
+
     def _flow_no_uns(self) -> List[str]:
-        """This machine's flow agents with no unstrikeable state file (`poll-<agent>.json` where `uns_state` or the
-        default place says): never ran on unstrikeable here, so briefling pilots them without a link (§ 14). An
-        unreadable path counts as present: the link stays the way in."""
-        out = set()
-        for fs in getattr(self, "_flow_spaces", None) or []:
-            try:
-                if not flowswitch.uns_state_path(fs.agent, fs.uns_state).exists():
-                    out.add(fs.agent)
-            except (SwitchError, OSError, ValueError):
-                continue
-        return sorted(out)[:20]
+        return self._flow_runner.no_uns()
 
     def _flow_uns(self) -> List[str]:
-        """Agents with an unstrikeable state file on this machine (§ 15): the `poll-<agent>.json` of the default place
-        (`$UNS_HOME/state/`, else `~/.unstrikeable/state/`), plus the BRIEFLING_FLOW agents not in `no_uns`. The hub
-        pilots by default the instance's other agents; these keep the switch by link."""
-        out = {fs.agent for fs in getattr(self, "_flow_spaces", None) or []} - set(self._flow_no_uns())
-        try:
-            base = flowswitch.uns_state_path("x", None).parent
-            for p in base.glob("poll-*.json") if base.is_dir() else []:
-                name = p.name[len("poll-"):-len(".json")]
-                if flowswitch.AGENT_RE.match(name):
-                    out.add(name)
-        except OSError:
-            pass
-        return sorted(out)[:50]
+        return self._flow_runner.uns()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -1151,8 +1145,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             logger.debug("[%s] self-update state unreadable", self.name, exc_info=True)
         self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._run())
-        if self._flow_spaces:
-            self._start_flow()
+        self._flow_runner.start()
         self._bg_task = asyncio.create_task(self._bg_loop())
         self._mark_connected()
         self._wire_plugin_handlers(None)
@@ -1164,9 +1157,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         if self._previews.peers:  # gateway stop: no preview peer outlives it
             await asyncio.get_running_loop().run_in_executor(None, self._previews.close_all)
         self._mark_disconnected()
-        if self._flow_loop_task:
-            self._flow_loop_task.cancel()
-            self._flow_loop_task = None
+        self._flow_runner.stop()
         if getattr(self, "_bg_task", None):
             self._bg_task.cancel()
             self._bg_task = None
@@ -1308,13 +1299,13 @@ class BrieflingAdapter(BasePlatformAdapter):
             if isinstance(frame.get("thread"), str) and isinstance(frame.get("n"), int):
                 _thumbs.watchers(frame["thread"], frame["n"])
         elif kind == "flow.config":
-            await self._on_flow_config(frame)
+            await self._flow_runner.on_config(frame)
         elif kind == "flow.pause":
-            await self._on_flow_pause(frame)
+            await self._flow_runner.on_pause(frame)
         elif kind == "flow.wake":
-            self._on_flow_wake(frame)
+            self._flow_runner.on_wake(frame)
         elif kind == "flow.pilot":
-            await self._on_flow_pilot(frame)
+            await self._flow_runner.on_pilot(frame)
         elif kind == "preview.offer":
             await self._previews.offer(frame)
         elif kind == "preview.close":
@@ -1331,12 +1322,10 @@ class BrieflingAdapter(BasePlatformAdapter):
                     self._on_allowed(space, users)
             if isinstance(frame.get("approvals"), dict):
                 self._approval_modes = {s: apv.parse(v) for s, v in frame["approvals"].items() if isinstance(s, str)}
-            for host in list(self._flow.values()):   # a new connection: nobody pilots until the hub's flow.pilot says so
-                host.piloted = False
+            self._flow_runner.unpilot_all()   # a new connection: nobody pilots until the hub's flow.pilot says so
             if frame.get("denied"):
                 logger.warning("[%s] hub refused spaces: %s", self.name, ",".join(frame["denied"]))
-            for host in list(self._flow.values()):   # the hub may hold an old state: report it again (piloted only)
-                await self._flow_report(host, force=True)
+            await self._flow_runner.report_all()   # the hub may hold an old state: report it again (piloted only)
             self._offer_update(frame.get("release"))
         elif kind == "release":  # pushed by the hub once per deploy: no wait for the next connection
             self._offer_update(frame.get("release"))
@@ -2327,162 +2316,15 @@ class BrieflingAdapter(BasePlatformAdapter):
         from hermes_constants import get_hermes_home
         return Path(get_hermes_home()) / "briefling-flow"
 
-    def _start_flow(self) -> None:
-        state_dir = self._flow_state_dir()
-        for fs in self._flow_spaces:
-            self._flow[fs.space] = FlowHost(fs, state_dir, self._flow_request, self._flow_inject(fs.space))
-        logger.info("[%s] flow on for %s (every %.0f min)", self.name, ",".join(self._flow), self._flow_poll_min)
-        self._flow_loop_task = asyncio.create_task(self._flow_loop())
-
-    async def _flow_auto_host(self, space: str, agent: str) -> Optional["FlowHost"]:
-        """§ 15: the hub pilots `agent` in `space` by default and this machine has no BRIEFLING_FLOW entry there: a host
-        with no local config nor identity (config = the hub's `flow.config`, GitLab board = the hub, GitHub = `gh`)."""
-        if not self._flow_auto or not (ID_RE.match(space) and flowswitch.AGENT_RE.match(agent)):
-            return None
-        host = FlowHost(FlowSpace(space=space, agent=agent), self._flow_state_dir(), self._flow_request, self._flow_inject(space))
-        self._flow[space] = host
-        logger.info("[%s] flow on for %s/%s, piloted by briefling by default (no BRIEFLING_FLOW entry)", self.name, space, agent)
-        if self._flow_loop_task is None or self._flow_loop_task.done():
-            self._flow_loop_task = asyncio.create_task(self._flow_loop())
-        waiting = self._flow_cfg_wait.pop(space, None)
-        if waiting is not None:   # the hub sends the config before flow.pilot at a connection
-            await self._on_flow_config(waiting)
-        return host
-
-    async def _flow_loop(self) -> None:
-        """Timer: each host ticks every `poll_min` while the hub is reachable (degraded mode is a later slice)."""
-        while self._running:
-            try:
-                await self._opened.wait()
-                for host in list(self._flow.values()):
-                    # the config's limits.poll_min wins over the settings file (floor 1 min)
-                    if getattr(host, "piloted", False) and time.time() - host.last_tick >= max(1.0, host.poll_min or self._flow_poll_min) * 60:
-                        await self._flow_tick(host)
-                await asyncio.sleep(FLOW_TIMER_S)
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                logger.warning("[%s] flow timer error", self.name, exc_info=True)
-                await asyncio.sleep(FLOW_TIMER_S)
-
     async def _flow_tick(self, host: "FlowHost") -> str:
-        if not getattr(host, "piloted", False):   # unstrikeable (or nobody) pilots this agent: no tick, no report
-            return "not piloted"
-        thread = host.thread
-        alive = int(time.time()) if thread and thread in self._turns else self._flow_ended.get(thread or "")
-        try:
-            what = await host.tick(alive)
-        except Exception:
-            logger.warning("[%s] flow tick %s failed", self.name, host.fs.space, exc_info=True)
-            return "error"
-        logger.info("[%s] flow tick %s/%s: %s", self.name, host.fs.space, host.fs.agent, what)
-        await self._flow_report(host)
-        return what
+        return await self._flow_runner.tick(host)
 
     async def _flow_report(self, host: "FlowHost", force: bool = False) -> None:
-        """`flow.state` to the hub when what it shows changed (pause, task, spend, caps, alerts), or `force`."""
-        snap = getattr(host, "snapshot", None)
-        if snap is None or not getattr(host, "piloted", False):
-            return
-        thread = host.thread
-        running = bool(thread and (getattr(host, "task_turn", False) or thread in self._turns))
-        alive = self._turn_since.get(thread, 0) // 1000 if running and thread in self._turns else self._flow_ended.get(thread or "")
-        state = snap(running=running, alive=alive or None)
-        if not force and state == host.reported:
-            return
-        if await self._send_frame({"type": "flow.state", "space": host.fs.space, "agent": host.fs.agent, "state": state}):
-            host.reported = state
-
-    async def _on_flow_pause(self, frame: Dict[str, Any]) -> None:
-        """Pause / Resume of this machine's agent from briefling (a trusted human; the hub checked it)."""
-        host = self._flow.get(str(frame.get("space") or ""))
-        paused = frame.get("paused")
-        if host is None or frame.get("agent") != host.fs.agent or not isinstance(paused, bool):
-            return
-        by = re.sub(r"[\x00-\x1f\x7f]+", " ", str(frame.get("by") or "a human"))[:80]
-        changed = await host.set_paused(paused, by)
-        logger.info("[%s] flow %s/%s %s by %s%s", self.name, host.fs.space, host.fs.agent, "paused" if paused else "resumed",
-                    by, "" if changed else " (no change)")
-        await self._flow_report(host, force=True)
-        if changed and not paused:
-            self._on_flow_wake({"space": host.fs.space})
-
-    def _on_flow_wake(self, frame: Dict[str, Any]) -> None:
-        """« Read the board now »: a normal tick, unless the host ticked less than FLOW_WAKE_MIN_S ago."""
-        host = self._flow.get(str(frame.get("space") or ""))
-        if host is None or not getattr(host, "piloted", False):
-            return
-        if time.time() - host.last_tick < FLOW_WAKE_MIN_S:
-            logger.debug("[%s] flow wake %s skipped: ticked %.0f s ago", self.name, host.fs.space, time.time() - host.last_tick)
-            return
-        asyncio.ensure_future(self._flow_tick(host))
-
-    async def _on_flow_pilot(self, frame: Dict[str, Any]) -> None:
-        """Who pilots this machine's agent in the space (§ 13): true = tick, report, ask tasks; false = stop, and
-        after a switch write the engine state back to unstrikeable's file (« Back to unstrikeable »)."""
-        host = self._flow.get(str(frame.get("space") or ""))
-        piloted = frame.get("piloted")
-        if host is None and piloted is True and isinstance(frame.get("space"), str) and isinstance(frame.get("agent"), str):
-            host = await self._flow_auto_host(frame["space"], frame["agent"])
-        if host is None or frame.get("agent") != host.fs.agent or not isinstance(piloted, bool):
-            return
-        was, host.piloted = host.piloted, piloted
-        if piloted != was:
-            logger.info("[%s] flow %s/%s %s", self.name, host.fs.space, host.fs.agent,
-                        "piloted by briefling" if piloted else "not piloted by briefling")
-        if piloted:
-            await self._flow_report(host, force=True)
-            self._on_flow_wake({"space": host.fs.space})
-        elif isinstance(host.state.get("switched"), dict):
-            await host.switch_back()
+        await self._flow_runner.report(host, force)
 
     async def flow_switch(self, link: str) -> Dict[str, Any]:
         """`flow_switch` tool, on the gateway loop: redeem a switch link for the host of (space, agent)."""
-        try:
-            code, space, agent = parse_link(link)
-        except SwitchError as e:
-            return {"error": str(e)}
-        host = self._flow.get(space)
-        if host is None or host.fs.agent != agent:
-            return {"error": "this gateway runs no flow for %s in %s: add a BRIEFLING_FLOW entry for (space %s, agent %s) "
-                             "with its identity and uns_state, then restart the gateway" % (agent, space, space, agent)}
-        if not self._opened.is_set():
-            return {"error": "briefling hub not connected: retry when connected"}
-        try:
-            out = await host.switch(code)
-        except SwitchError as e:
-            return {"error": str(e)}
-        await self._flow_report(host, force=True)
-        asyncio.ensure_future(self._flow_tick(host))
-        return out
-
-    async def _on_flow_config(self, frame: Dict[str, Any]) -> None:
-        """The space's flow config from the hub's editor: loaded by the host of that space (its agent), answered with
-        `flow.config.status`. A space this machine runs no flow for is ignored: the editor then shows no answer."""
-        host = self._flow.get(str(frame.get("space") or ""))
-        version, sha = frame.get("version"), frame.get("sha")
-        if not isinstance(version, int) or isinstance(version, bool) or not isinstance(sha, str):
-            return
-        if host is None:   # no host yet: kept for the one `flow.pilot true` may make (§ 15), the latest only
-            space = frame.get("space")
-            if self._flow_auto and isinstance(space, str) and ID_RE.match(space):
-                self._flow_cfg_wait = {**{k: v for k, v in self._flow_cfg_wait.items() if k != space}, space: frame}
-                while len(self._flow_cfg_wait) > 20:
-                    self._flow_cfg_wait.pop(next(iter(self._flow_cfg_wait)))
-            return
-        async with self._flow_config_lock:
-            try:
-                ok, error = await asyncio.to_thread(host.apply_config, version, sha, frame.get("files"))
-            except Exception as e:  # disk full, permissions: reported, the previous bundle stays
-                ok, error = False, "%s: %s" % (type(e).__name__, str(e)[:200])
-        logger.info("[%s] flow config %s v%s for %s: %s", self.name, host.fs.space, version, host.fs.agent, "ok" if ok else error)
-        status = {"type": "flow.config.status", "space": host.fs.space, "agent": host.fs.agent, "version": version, "sha": sha, "ok": ok}
-        if not ok:
-            status["error"] = error or "error"
-        commit = frame.get("commit")
-        if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):   # git source: the head it came from
-            status["commit"] = commit
-        await self._send_frame(status)
+        return await self._flow_runner.switch(link)
 
     async def _flow_request(self, frame: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -2491,35 +2333,24 @@ class BrieflingAdapter(BasePlatformAdapter):
             raise HubAnswer(e.code) from e
 
     def _flow_inject(self, space: str):
-        async def inject(thread: str, title: str, text: str) -> None:
-            """The task turn, in the issue thread's own session. Internal event: no human sent it (Hermes skips the
-            user allowlist for it and never lets it interrupt a running turn)."""
-            self._thread_space[thread] = space
-            self._titles[thread] = title
-            self._flow_turns[thread] = self._flow[space]
-            msg_id = f"{FLOW_MSG_PREFIX}{new_id()}"
-            source = self.build_source(chat_id=thread, chat_name=title, chat_type="dm", user_id=FLOW_USER,
-                                       user_name="briefling flow", message_id=msg_id)
-            await self.handle_message(MessageEvent(
-                text=FLOW_PREAMBLE + text, message_type=MessageType.TEXT, source=source, message_id=msg_id,
-                timestamp=datetime.now(tz=timezone.utc), internal=True))
-        return inject
+        """The host's inject for `space` (the runner remembers the task turn's host, then calls the gateway's)."""
+        return self._flow_runner.inject_for(space)
+
+    async def _flow_gateway_inject(self, space: str, thread: str, title: str, text: str) -> None:
+        """The task turn, in the issue thread's own session. Internal event: no human sent it (Hermes skips the
+        user allowlist for it and never lets it interrupt a running turn)."""
+        self._thread_space[thread] = space
+        self._titles[thread] = title
+        msg_id = f"{FLOW_MSG_PREFIX}{new_id()}"
+        source = self.build_source(chat_id=thread, chat_name=title, chat_type="dm", user_id=FLOW_USER,
+                                   user_name="briefling flow", message_id=msg_id)
+        await self.handle_message(MessageEvent(
+            text=FLOW_PREAMBLE + text, message_type=MessageType.TEXT, source=source, message_id=msg_id,
+            timestamp=datetime.now(tz=timezone.utc), internal=True))
 
     def _flow_turn_ended(self, thread: str, msg_id: str, usage: Optional[Dict[str, Any]]) -> None:
-        """Spend tagged `task` (the flow's turn) or `discussion` (a human in a flow space); a task turn's end ticks
-        at once, so a closed task is seen without waiting for the timer."""
-        self._flow_ended[thread] = int(time.time())
-        host = self._flow_turns.get(thread) if msg_id.startswith(FLOW_MSG_PREFIX) else None
-        if host is not None:
-            self._flow_turns.pop(thread, None)
-            host.add_usage("task", usage)
-            host.turn_ended()
-            asyncio.ensure_future(self._flow_tick(host))
-            return
-        host = self._flow.get(self._thread_space.get(thread, ""))
-        if host is not None:
-            host.add_usage("discussion", usage)
-            asyncio.ensure_future(self._flow_report(host))
+        """Spend tagged `task` (a turn the flow injected) or `discussion`; see FlowRunner.turn_ended."""
+        self._flow_runner.turn_ended(thread, self._thread_space.get(thread), msg_id.startswith(FLOW_MSG_PREFIX), usage)
 
     def flow_host(self, thread: str) -> Optional["FlowHost"]:
         return self._flow.get(self._thread_space.get(thread, ""))
@@ -3382,55 +3213,6 @@ def memory_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("memory_propose", thread, lambda a: a.memory_propose(thread, text, kind, sources, tags or [], replaces or [], title))
 
 
-BOARD_REF = {"type": "string", "description": "The board item, owner/repo#number (e.g. acme/app#80): one of your departments' repos."}
-BOARD_STATUS_SCHEMA = {
-    "name": "board_status",
-    "description": (
-        "Post your status on a board item: working, done or blocked. briefling flow only, in a board-driven space: written on GitHub as your one status "
-        "comment (edited in place). Call it with state='working' when you start a task, then ALWAYS end the task with "
-        "state='done' (with kind when the flow has kinds, and learned = '<rule> because <reason>' or 'none') or "
-        "state='blocked' (waiting for a human: say what in todo)."
-    ),
-    "parameters": {"type": "object", "properties": {
-        "ref": BOARD_REF,
-        "state": {"type": "string", "enum": ["working", "done", "blocked"]},
-        "todo": {"type": "string", "description": "Next step (working) or what you need from a human (blocked)."},
-        "done": {"type": "string", "description": "What is done so far."},
-        "note": {"type": "string", "description": "Optional extra line."},
-        "kind": {"type": "string", "description": "Kind of work, required at done when the flow declares kinds."},
-        "learned": {"type": "string", "description": "Required at done: '<rule> because <reason>', or 'none'."},
-    }, "required": ["ref", "state"]},
-}
-BOARD_COMMENT_SCHEMA = {
-    "name": "board_comment",
-    "description": "Comment on a board item (GitHub issue). briefling flow only, with your own identity. Repos may be public: no secrets.",
-    "parameters": {"type": "object", "properties": {"ref": BOARD_REF, "body": {"type": "string", "description": "GitHub Markdown."}},
-                   "required": ["ref", "body"]},
-}
-BOARD_MOVE_SCHEMA = {
-    "name": "board_move",
-    "description": "Move a board item to a state of its flow. briefling flow only: the state key, e.g. 'doing', 'review'.",
-    "parameters": {"type": "object", "properties": {
-        "ref": BOARD_REF, "state": {"type": "string", "description": "State key of the flow."},
-        "force": {"type": "boolean", "description": "Move to ready/doing although blocked: only if a human said so."},
-    }, "required": ["ref", "state"]},
-}
-BOARD_SET_SCHEMA = {
-    "name": "board_set",
-    "description": "Set a single-select field of a board item. briefling flow only, e.g. field 'Size', value 'M'.",
-    "parameters": {"type": "object", "properties": {"ref": BOARD_REF, "field": {"type": "string"}, "value": {"type": "string"}},
-                   "required": ["ref", "field", "value"]},
-}
-BOARD_LABEL_SCHEMA = {
-    "name": "board_label",
-    "description": "Add or remove labels on a board item (briefling flow only). Assignment labels (role:agent) are set by humans only.",
-    "parameters": {"type": "object", "properties": {
-        "ref": BOARD_REF,
-        "add": {"type": "array", "items": {"type": "string"}}, "remove": {"type": "array", "items": {"type": "string"}},
-    }, "required": ["ref"]},
-}
-
-
 def _board_tool(tool: str, args: Dict[str, Any], call) -> str:
     """Board tools run in the agent's Python thread (blocking GitHub calls), on the host of the conversation's space."""
     from tools.registry import tool_error
@@ -3475,17 +3257,6 @@ def _labels(x: Any) -> List[str]:
 def board_label_tool(args: Dict[str, Any], **_: Any) -> str:
     return _board_tool("board_label", args, lambda h, ref: h.board_label(ref, _labels(args.get("add")), _labels(args.get("remove"))))
 
-
-FLOW_SWITCH_SCHEMA = {
-    "name": "flow_switch",
-    "description": (
-        "Switch your board work from unstrikeable to briefling. In a space, with the link an admin "
-        "gave you. Imports your unstrikeable state, pauses it, and briefling pilots from then on. Afterwards, remove "
-        "your uns_poll cron job."),
-    "parameters": {"type": "object", "properties": {
-        "link": {"type": "string", "description": "The whole switch link (…/agent.md?switch=…&space=…&agent=…)."},
-    }, "required": ["link"]},
-}
 
 
 def flow_switch_tool(args: Dict[str, Any], **_: Any) -> str:

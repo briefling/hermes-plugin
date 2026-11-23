@@ -214,7 +214,12 @@ class FlowHost:
                    "alive": int(alive) if alive else None} if isinstance(cur, dict) and cur.get("ref") else None
         alerts = [{"at": int(a.get("ts") or 0), "ref": str(a.get("ref") or "-"), "text": str(a.get("msg") or "")[:300]}
                   for a in (self.engine.get("alerts") or []) if int(a.get("ts") or 0) >= now - ALERTS_AGE_S][-ALERTS_SHOWN:]
-        return {"paused": paused, "current": current, "usage": usage, "caps": dict(self.caps), "alerts": alerts}
+        out = {"paused": paused, "current": current, "usage": usage, "caps": dict(self.caps), "alerts": alerts}
+        perm = self.state.get("perm")   # ACP bridge: a refused permission blocked a task (cleared on Resume)
+        if isinstance(perm, dict) and paused:
+            out["perm"] = {"at": int(perm.get("at") or 0), "ref": str(perm.get("ref") or "-"),
+                           "what": str(perm.get("what") or "")[:80], "fix": str(perm.get("fix") or "")[:300]}
+        return out
 
     async def set_paused(self, paused: bool, by: str) -> bool:
         """Pause / Resume from briefling. A running turn is not cut; a paused agent takes no new task. Resume also
@@ -227,6 +232,7 @@ class FlowHost:
                 self.engine["paused"] = {"ts": now, "reason": "paused from briefling by %s" % by, "by": "human"}
             else:
                 p = self.engine.pop("paused", None)
+                self.state.pop("perm", None)
                 if not p:
                     return False
                 if isinstance(p, dict) and p.get("by") == "quota":
@@ -360,8 +366,9 @@ class FlowHost:
 
     async def _done(self, rec: Dict[str, Any]) -> None:
         # The engine closes only its current task, the one placed last: its task-tagged spend since it was placed.
-        task = (self.state.get("counters") or {}).get("task") or ZERO
-        spent = usage_delta(self.state.get("task_usage0"), task) if self.state.get("task_key") else None
+        # No usage ever recorded (an ACP agent reports none): cost unknown, never a $0 the Board would show as such.
+        task = (self.state.get("counters") or {}).get("task")
+        spent = usage_delta(self.state.get("task_usage0"), task) if self.state.get("task_key") and task else None
         record = {"outcome": rec.get("outcome") if rec.get("outcome") in ("done", "blocked", "gone", "lost") else "gone",
                   "kind": rec.get("kind"), "trigger": rec.get("trigger"), "start": int(rec.get("start") or 0),
                   "end": int(rec.get("end") or 0), "retries": int(rec.get("retries") or 0), "runs": int(rec.get("runs") or 0),
