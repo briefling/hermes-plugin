@@ -181,6 +181,10 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     RADAR_PROFILE_SENT,
     RADAR_PROFILE_ERRORS,
     RADAR_RECORDED,
+    RADAR_CLEAR_SCHEMA,
+    RADAR_CLEAR_ERRORS,
+    RADAR_CLEARED,
+    build_radar_clear,
     build_radar_signal,
     build_radar_profile,
     OUTCOME_ERRORS,
@@ -276,7 +280,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.106"
+VERSION = "0.3.107"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1635,6 +1639,16 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "signal": ack.get("msg_id"), "detail": RADAR_RECORDED}
+
+    async def radar_clear(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """radar.clear: a tech signal of a managed pass that no longer holds, dismissed as no longer found with its proof."""
+        try:
+            ack = await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            return {"ok": False, "error": e.code, "detail": RADAR_CLEAR_ERRORS.get(e.code, e.code)}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return {"ok": True, "signal": ack.get("msg_id"), "detail": RADAR_CLEARED}
 
     async def mail_import(self, thread: str, mails: List[Dict[str, Any]]) -> Dict[str, Any]:
         """mail.import, one frame per mail (each fits one WebSocket frame): per mail imported / known / refused."""
@@ -3139,6 +3153,18 @@ def radar_signal_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("radar_signal", thread, lambda a: a.radar_signal(thread, frame))
 
 
+def radar_clear_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: radar.clear (managed Radar pass only; the hub checks the pass, the turn, the budget and the signal)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("radar_clear")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_radar_clear(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("radar_clear", thread, lambda a: a.radar_clear(thread, frame))
+
+
 def mail_import_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: mail.import (a lead's turn only; the hub checks the turn, the correspondents and each mail)."""
     from tools.registry import tool_error
@@ -3425,6 +3451,8 @@ def register(ctx) -> None:
                           description=APPLET_LIST_SCHEMA["description"], emoji="🧩")
         ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
                           description=RADAR_SIGNAL_SCHEMA["description"], emoji="📡")
+        ctx.register_tool(name="radar_clear", toolset="briefling", schema=RADAR_CLEAR_SCHEMA, handler=radar_clear_tool,
+                          description=RADAR_CLEAR_SCHEMA["description"], emoji="📡")
         ctx.register_tool(name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,
                           description=RADAR_PROFILE_SCHEMA["description"], emoji="🧭")
         ctx.register_tool(name="memory_propose", toolset="briefling", schema=MEMORY_PROPOSE_SCHEMA, handler=memory_propose_tool,
