@@ -133,6 +133,7 @@ from . import approvals as apv
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     BOARD_REF, BOARD_STATUS_SCHEMA, BOARD_COMMENT_SCHEMA, BOARD_MOVE_SCHEMA, BOARD_SET_SCHEMA, BOARD_LABEL_SCHEMA,
     FLOW_SWITCH_SCHEMA, FLOW_PREAMBLE,
+    reply_hint,
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
     clean_context,
@@ -275,7 +276,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.105"
+VERSION = "0.3.106"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1375,7 +1376,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         if not MessageEvent(text=text).get_command():
             pasted, inlined = inline_texts(media_urls, kept, msg.get("files"), str(author.get("id") or ""))
             text = with_context(frame.get("context") or {},
-                                vault.hint(thread) + edit_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True
+                                vault.hint(thread) + edit_hint(msg) + reply_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True
                                  else VOICE_TALK_HINT if self._previews.share_of(thread, pv.VOICE) else "") + text
                                 + (f"\n\n{pasted}" if pasted else ""),
                                 mounted=self._mounted(str(frame.get("space") or "")))
