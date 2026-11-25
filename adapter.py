@@ -282,7 +282,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.111"
+VERSION = "0.3.112"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -291,6 +291,16 @@ MAX_ACTIVITY = 10  # protocol/frames.ts MAX_ACTIVITY (status.recent)
 # turn_outcome posted its text: the answer is out, the final reply of the turn is not shown (send() drops it).
 ANSWER_POSTED = ("Your text is posted in the thread. Do not restate or translate it: your final reply of this turn is not "
                  "shown, end it with nothing more to say.")
+
+
+MEDIA_TIMEOUT_S = 120  # turn_outcome / ask_choices may upload a few files (MEDIA tags) before they answer
+
+
+def media_not_found(paths: List[str]) -> Dict[str, Any]:
+    """A MEDIA tag the gateway host cannot deliver: refused whole, nothing posted (a raw tag shows no file)."""
+    return {"ok": False, "error": "media_not_found", "detail": (
+        f"media_not_found {', '.join(paths)}: no such file on the gateway host (or refused by its delivery policy). "
+        "Nothing was posted. Call again with the host path of each file (MEDIA:<path>), or without that line.")}
 
 # turn_outcome waiting with nothing posted yet: how long to wait for text the gateway still has queued. Text written
 # in the same model step as the tool call goes through the gateway's stream consumer (a queue drained every
@@ -1705,13 +1715,20 @@ class BrieflingAdapter(BasePlatformAdapter):
         return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["request_elevation"]}
 
     async def ask_choices(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
-        """Show a « To decide » card (frame from build_ask_choices). The turn goes on: the answer is a later message."""
+        """Show a « To decide » card (frame from build_ask_choices). The turn goes on: the answer is a later message.
+        ``MEDIA:<path>`` lines of the intro leave the card and are posted as attachments once the card is shown."""
+        intro, files, missing = self._media_of(frame.get("text") or "")
+        if missing:
+            return media_not_found(missing)
         try:
-            ack = await self._request({**frame, "thread": thread})
+            ack = await self._request({**frame, "text": intro, "thread": thread})
         except HubRefused as e:
             return {"ok": False, "error": e.code, "detail": ASK_ERRORS.get(e.code, e.code)}
         except (ConnectionError, asyncio.TimeoutError):
             return {"ok": False, "error": "hub_unreachable", "detail": "briefling hub not reachable, try again later."}
+        if files and not await self._post_media(thread, files):
+            return {"ok": False, "error": "hub_unreachable", "card": ack.get("msg_id"),
+                    "detail": "The card is shown but its attachments were not posted: briefling hub not reachable."}
         return {"ok": True, "card": ack.get("msg_id"), "detail": CARD_SHOWN["ask_choices"]}
 
     async def poll_vote(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
@@ -1815,7 +1832,12 @@ class BrieflingAdapter(BasePlatformAdapter):
         field) is posted first. The hub applies the gates."""
         outcome = frame["outcome"]
         self._answered.discard(thread)
-        if text and not (await self.send(thread, text)).success:
+        body, files, missing = self._media_of(text)
+        if missing:
+            return media_not_found(missing)
+        if body and not (await self.send(thread, body)).success:
+            return dict(HUB_UNREACHABLE)
+        if files and not await self._post_media(thread, files):
             return dict(HUB_UNREACHABLE)
         if outcome == "waiting" and not await self._has_spoken(thread):
             return {"ok": False, "error": "no_text", "detail": NO_TEXT}
@@ -2064,6 +2086,38 @@ class BrieflingAdapter(BasePlatformAdapter):
         ok = await self._send_frame({"type": "message.final", "thread": chat_id, "msg_id": msg_id, "text": (caption or " ")[:MAX_TEXT],
                                      "rev": self._next_rev(), "files": [fid]})
         return SendResult(success=ok, message_id=msg_id if ok else None, error=None if ok else "hub not connected")
+
+    def _media_of(self, text: str) -> Tuple[str, List[str], List[str]]:
+        """``MEDIA:<path>`` tags of a tool's text (turn_outcome ``text``, ask_choices ``intro``) -> (text without them,
+        files to post, paths the host cannot deliver). Same extraction and path policy as the gateway's final reply
+        (tags in code stay text, sandbox paths translated): the gateway only reads MEDIA in the final reply, so text a
+        tool posts would otherwise show the raw tag and no file."""
+        if "MEDIA:" not in text:
+            return text, [], []
+        found, body = self.extract_media(text)
+        files: List[str] = []
+        missing: List[str] = []
+        for path, voice in found:
+            ok = self.filter_media_delivery_paths([(path, voice)])
+            if ok:
+                files.append(ok[0][0])
+            else:
+                missing.append(path)
+        return body, files, missing
+
+    async def _post_media(self, thread: str, files: List[str]) -> bool:
+        """Post each file as its own attachment message (image, audio or document: the client shows it by its mime)."""
+        try:
+            from gateway.platforms.docker_media_paths import hand_back_unreadable_media
+            await hand_back_unreadable_media(files)  # a root Docker sandbox's chmod 600 files
+        except ImportError:  # older Hermes
+            pass
+        for path in files:
+            r = await self._send_file(thread, path, None)
+            if not r.success:
+                return False
+            self._spoke.add(str(thread))
+        return True
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -2485,7 +2539,7 @@ def ask_choices_tool(args: Dict[str, Any], task_id: str = "", **_: Any) -> str:
     frame, bad = build_ask_choices(args)
     if bad:
         return tool_error(bad)
-    return _on_adapter("ask_choices", thread, lambda a: a.ask_choices(thread, frame), any_adapter=True)
+    return _on_adapter("ask_choices", thread, lambda a: a.ask_choices(thread, frame), timeout=MEDIA_TIMEOUT_S, any_adapter=True)
 
 
 def poll_vote_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2623,7 +2677,8 @@ def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
     frame, err = build_turn_outcome(args)
     if err:
         return tool_error(err)
-    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, frame, str(args.get("text") or "").strip()))
+    return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, frame, str(args.get("text") or "").strip()),
+                       timeout=MEDIA_TIMEOUT_S)
 
 
 _ACQUIRE, _RELEASE = build_action("action.acquire"), build_action("action.release")
