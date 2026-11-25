@@ -282,7 +282,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.108"
+VERSION = "0.3.109"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1093,6 +1093,11 @@ class BrieflingAdapter(BasePlatformAdapter):
         ttl = cache_ttl()
         if ttl is not None:
             frame["plugin"]["cache_ttl"] = ttl
+        # tools: the briefling tools this gateway gives its agents (protocol/agentcaps.ts: Settings › Agents, warnings);
+        # voice_open only when a voice daemon is set up. None registered (a Hermes without register_tool): not announced.
+        tools = sorted(t for t in REGISTERED_TOOLS if t != "voice_open" or self._voice_dir)
+        if tools:
+            frame["plugin"]["tools"] = tools
         no_uns = self._flow_runner.no_uns()
         if no_uns:   # piloted by briefling by default, no switch by link (docs/design-flow.md § 14)
             frame["plugin"]["no_uns"] = no_uns
@@ -3254,6 +3259,16 @@ def _keep_turn_tools_visible() -> None:
     logger.info("briefling: %d turn tools kept visible (not behind Tool Search)", len(TURN_TOOLS))
 
 
+# Names of the briefling tools registered with Hermes (announced at subscribe: `subscribe.plugin.tools`).
+REGISTERED_TOOLS: List[str] = []
+
+
+def _register_tool(ctx, **kw) -> None:
+    ctx.register_tool(**kw)
+    if kw.get("name") and kw["name"] not in REGISTERED_TOOLS:
+        REGISTERED_TOOLS.append(kw["name"])
+
+
 def register(ctx) -> None:
     _keep_turn_tools_visible()
     kw = dict(
@@ -3293,91 +3308,91 @@ def register(ctx) -> None:
         ctx.register_platform(**kw)
     # Toolset "briefling": part of the implicit hermes-briefling bundle, so only briefling sessions see it.
     if hasattr(ctx, "register_tool"):
-        ctx.register_tool(name="propose_thread", toolset="briefling", schema=PROPOSE_SCHEMA, handler=propose_thread_tool,
+        _register_tool(ctx, name="propose_thread", toolset="briefling", schema=PROPOSE_SCHEMA, handler=propose_thread_tool,
                           description=PROPOSE_SCHEMA["description"], emoji="🧵")
-        ctx.register_tool(name="propose_issue", toolset="briefling", schema=ISSUE_SCHEMA, handler=propose_issue_tool,
+        _register_tool(ctx, name="propose_issue", toolset="briefling", schema=ISSUE_SCHEMA, handler=propose_issue_tool,
                           description=ISSUE_SCHEMA["description"], emoji="🐙")
-        ctx.register_tool(name="request_elevation", toolset="briefling", schema=ELEVATION_SCHEMA, handler=request_elevation_tool,
+        _register_tool(ctx, name="request_elevation", toolset="briefling", schema=ELEVATION_SCHEMA, handler=request_elevation_tool,
                           description=ELEVATION_SCHEMA["description"], emoji="🔐")
-        ctx.register_tool(name="ask_choices", toolset="briefling", schema=ASK_CHOICES_SCHEMA, handler=ask_choices_tool,
+        _register_tool(ctx, name="ask_choices", toolset="briefling", schema=ASK_CHOICES_SCHEMA, handler=ask_choices_tool,
                           description=ASK_CHOICES_SCHEMA["description"], emoji="🔀")
-        ctx.register_tool(name="poll_vote", toolset="briefling", schema=POLL_VOTE_SCHEMA, handler=poll_vote_tool,
+        _register_tool(ctx, name="poll_vote", toolset="briefling", schema=POLL_VOTE_SCHEMA, handler=poll_vote_tool,
                           description=POLL_VOTE_SCHEMA["description"], emoji="🗳️")
-        ctx.register_tool(name="propose_plan", toolset="briefling", schema=PLAN_SCHEMA, handler=propose_plan_tool,
+        _register_tool(ctx, name="propose_plan", toolset="briefling", schema=PLAN_SCHEMA, handler=propose_plan_tool,
                           description=PLAN_SCHEMA["description"], emoji="🗺️")
-        ctx.register_tool(name="propose_space_about", toolset="briefling", schema=ABOUT_SCHEMA, handler=propose_space_about_tool,
+        _register_tool(ctx, name="propose_space_about", toolset="briefling", schema=ABOUT_SCHEMA, handler=propose_space_about_tool,
                           description=ABOUT_SCHEMA["description"], emoji="📝")
-        ctx.register_tool(name="propose_action", toolset="briefling", schema=PROPOSE_ACTION_SCHEMA, handler=propose_action_tool,
+        _register_tool(ctx, name="propose_action", toolset="briefling", schema=PROPOSE_ACTION_SCHEMA, handler=propose_action_tool,
                           description=PROPOSE_ACTION_SCHEMA["description"], emoji="➕")
-        ctx.register_tool(name="topic_title", toolset="briefling", schema=TOPIC_TITLE_SCHEMA, handler=topic_title_tool,
+        _register_tool(ctx, name="topic_title", toolset="briefling", schema=TOPIC_TITLE_SCHEMA, handler=topic_title_tool,
                           description=TOPIC_TITLE_SCHEMA["description"], emoji="🏷️")
-        ctx.register_tool(name="turn_outcome", toolset="briefling", schema=OUTCOME_SCHEMA, handler=turn_outcome_tool,
+        _register_tool(ctx, name="turn_outcome", toolset="briefling", schema=OUTCOME_SCHEMA, handler=turn_outcome_tool,
                           description=OUTCOME_SCHEMA["description"], emoji="✅")
-        ctx.register_tool(name="acquire_action", toolset="briefling", schema=ACQUIRE_SCHEMA, handler=acquire_action_tool,
+        _register_tool(ctx, name="acquire_action", toolset="briefling", schema=ACQUIRE_SCHEMA, handler=acquire_action_tool,
                           description=ACQUIRE_SCHEMA["description"], emoji="🔒")
-        ctx.register_tool(name="release_action", toolset="briefling", schema=RELEASE_SCHEMA, handler=release_action_tool,
+        _register_tool(ctx, name="release_action", toolset="briefling", schema=RELEASE_SCHEMA, handler=release_action_tool,
                           description=RELEASE_SCHEMA["description"], emoji="🔓")
-        ctx.register_tool(name="acquire_resource", toolset="briefling", schema=ACQUIRE_ALIAS_SCHEMA, handler=acquire_action_tool,
+        _register_tool(ctx, name="acquire_resource", toolset="briefling", schema=ACQUIRE_ALIAS_SCHEMA, handler=acquire_action_tool,
                           description=ACQUIRE_ALIAS_SCHEMA["description"], emoji="🔒")
-        ctx.register_tool(name="release_resource", toolset="briefling", schema=RELEASE_ALIAS_SCHEMA, handler=release_action_tool,
+        _register_tool(ctx, name="release_resource", toolset="briefling", schema=RELEASE_ALIAS_SCHEMA, handler=release_action_tool,
                           description=RELEASE_ALIAS_SCHEMA["description"], emoji="🔓")
-        ctx.register_tool(name="pushed_commits", toolset="briefling", schema=PUSHED_SCHEMA, handler=pushed_commits_tool,
+        _register_tool(ctx, name="pushed_commits", toolset="briefling", schema=PUSHED_SCHEMA, handler=pushed_commits_tool,
                           description=PUSHED_SCHEMA["description"], emoji="🚦")
-        ctx.register_tool(name="preview_share", toolset="briefling", schema=PREVIEW_SHARE_SCHEMA, handler=preview_share_tool,
+        _register_tool(ctx, name="preview_share", toolset="briefling", schema=PREVIEW_SHARE_SCHEMA, handler=preview_share_tool,
                           description=PREVIEW_SHARE_SCHEMA["description"], emoji="🖥️")
-        ctx.register_tool(name="preview_stop", toolset="briefling", schema=PREVIEW_STOP_SCHEMA, handler=preview_stop_tool,
+        _register_tool(ctx, name="preview_stop", toolset="briefling", schema=PREVIEW_STOP_SCHEMA, handler=preview_stop_tool,
                           description=PREVIEW_STOP_SCHEMA["description"], emoji="🖥️")
-        ctx.register_tool(name="voice_open", toolset="briefling", schema=VOICE_OPEN_SCHEMA, handler=voice_open_tool,
+        _register_tool(ctx, name="voice_open", toolset="briefling", schema=VOICE_OPEN_SCHEMA, handler=voice_open_tool,
                           description=VOICE_OPEN_SCHEMA["description"], emoji="🎙️")
-        ctx.register_tool(name="memory_search", toolset="briefling", schema=MEMORY_SEARCH_SCHEMA, handler=memory_search_tool,
+        _register_tool(ctx, name="memory_search", toolset="briefling", schema=MEMORY_SEARCH_SCHEMA, handler=memory_search_tool,
                           description=MEMORY_SEARCH_SCHEMA["description"], emoji="🧠")
-        ctx.register_tool(name="memory_read", toolset="briefling", schema=MEMORY_READ_SCHEMA, handler=memory_read_tool,
+        _register_tool(ctx, name="memory_read", toolset="briefling", schema=MEMORY_READ_SCHEMA, handler=memory_read_tool,
                           description=MEMORY_READ_SCHEMA["description"], emoji="🧠")
         for schema, handler in ((SPACE_THREADS_SCHEMA, space_threads_tool), (THREAD_READ_SCHEMA, thread_read_tool),
                                 (SPACE_METRICS_SCHEMA, space_metrics_tool), (AGENT_CARD_SCHEMA, agent_card_tool)):
-            ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
+            _register_tool(ctx, name=schema["name"], toolset="briefling", schema=schema, handler=handler,
                               description=schema["description"], emoji="🔎")
         for schema, handler in ((SKILL_READ_SCHEMA, skill_read_tool), (SKILL_PROPOSE_SCHEMA, skill_propose_tool)):
-            ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
+            _register_tool(ctx, name=schema["name"], toolset="briefling", schema=schema, handler=handler,
                               description=schema["description"], emoji="📘")
-        ctx.register_tool(name="mail_import", toolset="briefling", schema=MAIL_IMPORT_SCHEMA, handler=mail_import_tool,
+        _register_tool(ctx, name="mail_import", toolset="briefling", schema=MAIL_IMPORT_SCHEMA, handler=mail_import_tool,
                           description=MAIL_IMPORT_SCHEMA["description"], emoji="✉️")
-        ctx.register_tool(name="exchange_read", toolset="briefling", schema=EXCHANGE_READ_SCHEMA, handler=exchange_read_tool,
+        _register_tool(ctx, name="exchange_read", toolset="briefling", schema=EXCHANGE_READ_SCHEMA, handler=exchange_read_tool,
                           description=EXCHANGE_READ_SCHEMA["description"], emoji="📨")
-        ctx.register_tool(name="exchange_summary", toolset="briefling", schema=EXCHANGE_SUMMARY_SCHEMA, handler=exchange_summary_tool,
+        _register_tool(ctx, name="exchange_summary", toolset="briefling", schema=EXCHANGE_SUMMARY_SCHEMA, handler=exchange_summary_tool,
                           description=EXCHANGE_SUMMARY_SCHEMA["description"], emoji="🧾")
-        ctx.register_tool(name="applet_propose", toolset="briefling", schema=APPLET_PROPOSE_SCHEMA, handler=applet_propose_tool,
+        _register_tool(ctx, name="applet_propose", toolset="briefling", schema=APPLET_PROPOSE_SCHEMA, handler=applet_propose_tool,
                           description=APPLET_PROPOSE_SCHEMA["description"], emoji="🧩")
-        ctx.register_tool(name="reminder_propose", toolset="briefling", schema=REMINDER_PROPOSE_SCHEMA, handler=reminder_propose_tool,
+        _register_tool(ctx, name="reminder_propose", toolset="briefling", schema=REMINDER_PROPOSE_SCHEMA, handler=reminder_propose_tool,
                           description=REMINDER_PROPOSE_SCHEMA["description"], emoji="⏰")
-        ctx.register_tool(name="applet_list", toolset="briefling", schema=APPLET_LIST_SCHEMA, handler=applet_list_tool,
+        _register_tool(ctx, name="applet_list", toolset="briefling", schema=APPLET_LIST_SCHEMA, handler=applet_list_tool,
                           description=APPLET_LIST_SCHEMA["description"], emoji="🧩")
-        ctx.register_tool(name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
+        _register_tool(ctx, name="radar_signal", toolset="briefling", schema=RADAR_SIGNAL_SCHEMA, handler=radar_signal_tool,
                           description=RADAR_SIGNAL_SCHEMA["description"], emoji="📡")
-        ctx.register_tool(name="radar_clear", toolset="briefling", schema=RADAR_CLEAR_SCHEMA, handler=radar_clear_tool,
+        _register_tool(ctx, name="radar_clear", toolset="briefling", schema=RADAR_CLEAR_SCHEMA, handler=radar_clear_tool,
                           description=RADAR_CLEAR_SCHEMA["description"], emoji="📡")
-        ctx.register_tool(name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,
+        _register_tool(ctx, name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,
                           description=RADAR_PROFILE_SCHEMA["description"], emoji="🧭")
-        ctx.register_tool(name="memory_propose", toolset="briefling", schema=MEMORY_PROPOSE_SCHEMA, handler=memory_propose_tool,
+        _register_tool(ctx, name="memory_propose", toolset="briefling", schema=MEMORY_PROPOSE_SCHEMA, handler=memory_propose_tool,
                           description=MEMORY_PROPOSE_SCHEMA["description"], emoji="🧠")
-        ctx.register_tool(name="memory_review", toolset="briefling", schema=MEMORY_REVIEW_SCHEMA, handler=memory_review_tool,
+        _register_tool(ctx, name="memory_review", toolset="briefling", schema=MEMORY_REVIEW_SCHEMA, handler=memory_review_tool,
                           description=MEMORY_REVIEW_SCHEMA["description"], emoji="🧠")
-        ctx.register_tool(name="memory_compact", toolset="briefling", schema=MEMORY_COMPACT_SCHEMA, handler=memory_compact_tool,
+        _register_tool(ctx, name="memory_compact", toolset="briefling", schema=MEMORY_COMPACT_SCHEMA, handler=memory_compact_tool,
                           description=MEMORY_COMPACT_SCHEMA["description"], emoji="🧠")
-        ctx.register_tool(name="memory_tag", toolset="briefling", schema=MEMORY_TAG_SCHEMA, handler=memory_tag_tool,
+        _register_tool(ctx, name="memory_tag", toolset="briefling", schema=MEMORY_TAG_SCHEMA, handler=memory_tag_tool,
                           description=MEMORY_TAG_SCHEMA["description"], emoji="🧠")
-        ctx.register_tool(name="memory_tag_merge", toolset="briefling", schema=MEMORY_TAG_MERGE_SCHEMA, handler=memory_tag_merge_tool,
+        _register_tool(ctx, name="memory_tag_merge", toolset="briefling", schema=MEMORY_TAG_MERGE_SCHEMA, handler=memory_tag_merge_tool,
                           description=MEMORY_TAG_MERGE_SCHEMA["description"], emoji="🧠")
-        ctx.register_tool(name="memory_tag_threads", toolset="briefling", schema=MEMORY_TAG_THREADS_SCHEMA, handler=memory_tag_threads_tool,
+        _register_tool(ctx, name="memory_tag_threads", toolset="briefling", schema=MEMORY_TAG_THREADS_SCHEMA, handler=memory_tag_threads_tool,
                           description=MEMORY_TAG_THREADS_SCHEMA["description"], emoji="🧠")
         for schema, handler in ((BOARD_STATUS_SCHEMA, board_status_tool), (BOARD_COMMENT_SCHEMA, board_comment_tool),
                                 (BOARD_MOVE_SCHEMA, board_move_tool), (BOARD_LABEL_SCHEMA, board_label_tool),
                                 (BOARD_SET_SCHEMA, board_set_tool)):
-            ctx.register_tool(name=schema["name"], toolset="briefling", schema=schema, handler=handler,
+            _register_tool(ctx, name=schema["name"], toolset="briefling", schema=schema, handler=handler,
                               description=schema["description"], emoji="📋")
-        ctx.register_tool(name="flow_switch", toolset="briefling", schema=FLOW_SWITCH_SCHEMA, handler=flow_switch_tool,
+        _register_tool(ctx, name="flow_switch", toolset="briefling", schema=FLOW_SWITCH_SCHEMA, handler=flow_switch_tool,
                           description=FLOW_SWITCH_SCHEMA["description"], emoji="🔀")
-        ctx.register_tool(name="secret_totp", toolset="briefling", schema=vault.SECRET_TOTP_SCHEMA,
+        _register_tool(ctx, name="secret_totp", toolset="briefling", schema=vault.SECRET_TOTP_SCHEMA,
                           handler=vault.secret_totp_tool, description=vault.SECRET_TOTP_SCHEMA["description"], emoji="🔑")
     if hasattr(ctx, "register_cli_command"):  # `hermes briefling join <code-or-link>`
         from . import join
