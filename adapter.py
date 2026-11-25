@@ -282,7 +282,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.110"
+VERSION = "0.3.111"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1341,7 +1341,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._offer_update(frame.get("release"))
         elif kind == "release":  # pushed by the hub once per deploy: no wait for the next connection
             self._offer_update(frame.get("release"))
-        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "action.result", "memory.result", "introspect.result", "agentcard.result", "skill.result", "skill.proposed", "memory.proposed", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "board.items", "board.written", "mail.imported", "exchange.read",
+        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "action.result", "memory.result", "introspect.result", "agentcard.result", "skill.result", "skill.proposed", "memory.proposed", "memory.kept", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "board.items", "board.written", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1961,13 +1961,13 @@ class BrieflingAdapter(BasePlatformAdapter):
                 "detail": "Tags saved." + (" Skipped: not a conversation of the list, tagged meanwhile, or a tag outside the space's list." if skipped else "")}
 
     async def memory_compact(self, thread: str, text: str, kind: str, sources: List[str], supersedes: List[str], tags: List[str],
-                             drop: bool = False) -> Dict[str, Any]:
+                             drop: bool = False, keep: bool = False) -> Dict[str, Any]:
         """memory.synthesis: the memory agent's synthesis (merge, rewrite, or drop) replacing published entries (the hub
         checks thread, agent, turn, ids)."""
         try:
             res = await self._request({"type": "memory.synthesis", "thread": thread, "text": text, "kind": kind,
                                        "sources": sources, "supersedes": supersedes, **({"tags": tags} if tags else {}),
-                                       **({"drop": True} if drop else {})})
+                                       **({"drop": True} if drop else {}), **({"keep": True} if keep else {})})
         except HubRefused as e:
             detail = {"forbidden": "Only the space's memory agent, in the memory conversation, during a compaction the hub asked for.",
                       "not_found": "One of the ids is not a published entry of this space (archived, pending or unknown).",
@@ -1977,9 +1977,13 @@ class BrieflingAdapter(BasePlatformAdapter):
                       "bad_frame": (f"Invalid synthesis: text 1-{MEMORY_SYNTHESIS_MAX} chars ({MEMORY_TEXT_MAX} for a rewrite of one entry), kind fact|rule, "
                                     f"{MEMORY_SUPERSEDES[0]}-{MEMORY_SUPERSEDES[1]} distinct ids, 0-{MEMORY_SOURCES_MAX} sources.")
                       }.get(e.code, e.code)
+            if keep and e.code == "forbidden":
+                detail = "keep is only a verdict of a deep clean pass (the hub's message says DEEP CLEAN)."
             return {"ok": False, "error": e.code, "detail": detail}
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
+        if keep:
+            return {"ok": True, "kept": res.get("kept"), "detail": "Kept as they are: those entries will not come back in this deep clean."}
         if res.get("status") != "pending":  # agentAuto space: published (or, for a drop, archived) at once
             return {"ok": True, "id": res.get("id"), "status": res.get("status"),
                     "detail": ("Applied: those entries are removed (they stay restorable)." if drop else
@@ -2825,6 +2829,7 @@ MEMORY_COMPACT_SCHEMA = {
         "properties": {
             "text": {"type": "string", "description": f"The synthesis (max {MEMORY_SYNTHESIS_MAX} chars) or rewrite (max {MEMORY_TEXT_MAX}), in the entries' language; with drop: why in one line."},
             "drop": {"type": "boolean", "description": "true: remove the supersedes entries (they only describe the code); text = why."},
+            "keep": {"type": "boolean", "description": "Deep clean only: true = the supersedes entries stay as they are (a verdict, nothing is written); text = 'keep'."},
             "kind": {"type": "string", "enum": ["fact", "rule"], "description": "rule if it tells agents how to behave (forced when a replaced entry is a rule)."},
             "supersedes": {"type": "array", "minItems": MEMORY_SUPERSEDES[0], "maxItems": MEMORY_SUPERSEDES[1], "items": {"type": "string"},
                            "description": "Ids of the published entries this synthesis replaces (1 for a rewrite or a drop)."},
@@ -2983,6 +2988,11 @@ def memory_compact_tool(args: Dict[str, Any], **_: Any) -> str:
     ids = args.get("supersedes")
     raw = args.get("sources") or []
     drop = args.get("drop") is True
+    keep = args.get("keep") is True
+    if keep and drop:
+        return tool_error("keep and drop are two different verdicts: one per call.")
+    if keep:
+        text, kind = text or "keep", kind or "fact"
     if not text or len(text) > MEMORY_SYNTHESIS_MAX:
         return tool_error(f"text is required, max {MEMORY_SYNTHESIS_MAX} chars.")
     if isinstance(ids, list) and len(ids) == 1 and not drop and len(text) > MEMORY_TEXT_MAX:
@@ -3000,7 +3010,7 @@ def memory_compact_tool(args: Dict[str, Any], **_: Any) -> str:
     tags, terr = clean_tags(args.get("tags") or None, required=False)
     if terr:
         return tool_error(terr)
-    return _on_adapter("memory_compact", thread, lambda a: a.memory_compact(thread, text, kind, sources, ids, tags or [], drop))
+    return _on_adapter("memory_compact", thread, lambda a: a.memory_compact(thread, text, kind, sources, ids, tags or [], drop, keep))
 
 
 def memory_review_tool(args: Dict[str, Any], **_: Any) -> str:
