@@ -282,7 +282,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.112"
+VERSION = "0.3.113"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -870,8 +870,11 @@ class HubRefused(Exception):
 RECORDING_RE = re.compile(r"audio-\d{4}-\d{2}-\d{2}-\d{4}\.(?:webm|m4a|ogg|mp3|wav|audio)")
 VOICE_HINT = ("[The human sent a voice note recorded in briefling. Answer what it says, in text as usual: the gateway "
               "gives you its transcript; if it could not transcribe it, the audio file path is given instead, "
-              "transcribe it yourself. If you have a text-to-speech tool, add after your text a short spoken summary "
-              "of your answer (2 or 3 sentences, same language), sent as audio.]\n")
+              "transcribe it yourself.]\n")
+# The sender ticked « Reply by voice » (`voiceReply` on the note's file, set by the hub from its message): the spoken
+# summary is asked only then, else a voice note gets a text answer only.
+VOICE_REPLY_HINT = ("[They ticked « Reply by voice »: if you have a text-to-speech tool, add after your text a short "
+                    "spoken summary of your answer (2 or 3 sentences, same language), sent as audio.]\n")
 
 
 def is_recording(f: Any) -> bool:
@@ -892,8 +895,12 @@ VOICE_TALK_HINT = ("[Voice channel open: the human talks to you out loud and eac
 
 
 def voice_hint(files: Any) -> str:
-    """Hidden nudge: a voice note gets a text answer plus, when the agent can, a short audio summary."""
-    return VOICE_HINT if any(is_recording(f) for f in (files if isinstance(files, list) else [])) else ""
+    """Hidden nudge: a voice note gets a text answer; plus, when its sender ticked « Reply by voice » and the agent
+    can, a short audio summary."""
+    notes = [f for f in (files if isinstance(files, list) else []) if is_recording(f)]
+    if not notes:
+        return ""
+    return VOICE_HINT + (VOICE_REPLY_HINT if any(f.get("voiceReply") is True for f in notes) else "")
 
 
 # Text attachments (a long paste the client turns into a collage-<date>.txt): their content rides in the message, as the
