@@ -182,6 +182,10 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     RADAR_PROFILE_SCHEMA,
     RADAR_PROFILE_SENT,
     RADAR_PROFILE_ERRORS,
+    RADAR_PROFILE_EDIT_SCHEMA,
+    RADAR_PROFILE_EDIT_ERRORS,
+    build_radar_profile_edit,
+    radar_edit_result,
     RADAR_RECORDED,
     RADAR_CLEAR_SCHEMA,
     RADAR_CLEAR_ERRORS,
@@ -282,7 +286,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.113"
+VERSION = "0.3.114"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -1358,7 +1362,7 @@ class BrieflingAdapter(BasePlatformAdapter):
             self._offer_update(frame.get("release"))
         elif kind == "release":  # pushed by the hub once per deploy: no wait for the next connection
             self._offer_update(frame.get("release"))
-        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "action.result", "memory.result", "introspect.result", "agentcard.result", "skill.result", "skill.proposed", "memory.proposed", "memory.kept", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "board.items", "board.written", "mail.imported", "exchange.read",
+        elif kind in ("upload.ready", "ack", "applet.list", "resource.result", "action.result", "memory.result", "introspect.result", "agentcard.result", "radar.edited", "skill.result", "skill.proposed", "memory.proposed", "memory.kept", "memory.reviewed", "memory.tagged", "memory.tagmerged", "memory.threadtagged", "flow.result", "board.items", "board.written", "mail.imported", "exchange.read",
                       "flow.switched", "preview.shared"):
             fut = self._waiting.pop(str(frame.get("client_id")), None)
             if fut and not fut.done():
@@ -1709,6 +1713,17 @@ class BrieflingAdapter(BasePlatformAdapter):
         except (ConnectionError, asyncio.TimeoutError):
             return dict(HUB_UNREACHABLE)
         return {"ok": True, "detail": RADAR_PROFILE_SENT}
+
+    async def radar_profile_edit(self, thread: str, frame: Dict[str, Any]) -> Dict[str, Any]:
+        """radar.edit: a lead's change of the validated Radar profile, applied at once (the hub checks lead, agent, turn)."""
+        try:
+            res = await self._request({**frame, "thread": thread})
+        except HubRefused as e:
+            detail = RADAR_PROFILE_EDIT_ERRORS.get(e.code, e.code)
+            return {"ok": False, "error": e.code, "detail": f"{detail} {e.detail}".strip() if e.code == "bad_profile" else detail}
+        except (ConnectionError, asyncio.TimeoutError):
+            return dict(HUB_UNREACHABLE)
+        return radar_edit_result(res)
 
     async def request_elevation(self, thread: str, account: str, minutes: int, reason: str) -> Dict[str, Any]:
         """Show an AWS elevation card. Nothing is granted until a trusted human approves it with a passkey."""
@@ -3208,6 +3223,18 @@ def radar_profile_tool(args: Dict[str, Any], **_: Any) -> str:
     return _on_adapter("radar_profile", thread, lambda a: a.radar_profile(thread, frame))
 
 
+def radar_profile_edit_tool(args: Dict[str, Any], **_: Any) -> str:
+    """Tool handler: radar.edit (a lead asked it in this turn; the hub checks the lead, the agent and the turn)."""
+    from tools.registry import tool_error
+    thread, err = _session_thread("radar_profile_edit")
+    if err:
+        return tool_error(err)
+    frame, ferr = build_radar_profile_edit(args)
+    if ferr:
+        return tool_error(ferr)
+    return _on_adapter("radar_profile_edit", thread, lambda a: a.radar_profile_edit(thread, frame))
+
+
 def memory_propose_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: memory.propose, waits for memory.proposed (published or waiting for a human)."""
     from tools.registry import tool_error
@@ -3445,6 +3472,8 @@ def register(ctx) -> None:
                           description=RADAR_CLEAR_SCHEMA["description"], emoji="📡")
         _register_tool(ctx, name="radar_profile", toolset="briefling", schema=RADAR_PROFILE_SCHEMA, handler=radar_profile_tool,
                           description=RADAR_PROFILE_SCHEMA["description"], emoji="🧭")
+        _register_tool(ctx, name="radar_profile_edit", toolset="briefling", schema=RADAR_PROFILE_EDIT_SCHEMA, handler=radar_profile_edit_tool,
+                          description=RADAR_PROFILE_EDIT_SCHEMA["description"], emoji="🧭")
         _register_tool(ctx, name="memory_propose", toolset="briefling", schema=MEMORY_PROPOSE_SCHEMA, handler=memory_propose_tool,
                           description=MEMORY_PROPOSE_SCHEMA["description"], emoji="🧠")
         _register_tool(ctx, name="memory_review", toolset="briefling", schema=MEMORY_REVIEW_SCHEMA, handler=memory_review_tool,
