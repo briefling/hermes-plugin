@@ -22,6 +22,16 @@ the hub, no inbound port.
   While the voice channel is open in a thread, each message there tells the agent to answer in 2 or 3 short
   sentences and to hand longer work to background sub-agents (`delegate_task`), since every spoken sentence
   interrupts its turn.
+- Spoken replies (`BRIEFLING_VOICE_MODE`, default `embedded`): when a human ticks « Reply by voice » on a voice note,
+  the agent ends its answer with a `🔊 <summary>` line; the plugin cuts it from the text and posts it as an audio note
+  in the agent's voice, Pocket TTS on the CPU (`briefling/voicekit/`). Nothing is installed before the first one: it
+  then builds a venv with `uv` from the pinned, hashed `voicekit/voice.lock` under `~/.cache/briefling/voice/` (~1 GB,
+  a grey line in the thread says so) and downloads the weights at pinned revisions (~0.2 GB). A warm worker keeps the
+  model loaded, stopped after 10 minutes unused. The gateway's own auto-TTS is off in this mode. `hermes` = as before
+  (the gateway's `text_to_speech` tool and its provider), `off` = no spoken reply. `BRIEFLING_VOICE_NAME` = a Pocket TTS
+  voice (`juergen` by default, `alba`, `marius`...) or a voice file, `BRIEFLING_VOICE_LANG` = its language (`french`).
+  Needs `uv`; macOS 14+ on Apple silicon, Linux or Windows x64 (no Intel Mac). Voice notes keep Hermes's own
+  transcription. Weights: Kyutai Pocket TTS, CC-BY 4.0.
 - Only messages from humans the space trusts reach the agent (checked by the hub, then again by the plugin through
   `BRIEFLING_ALLOWED_USERS`, or the hub's list with `BRIEFLING_ALLOWED_FROM=hub`, see below).
 

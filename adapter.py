@@ -87,6 +87,7 @@ Before the first list arrives, nobody is allowed (fail closed).
 """
 
 import asyncio
+import contextlib
 import functools
 import base64
 import contextvars
@@ -132,6 +133,7 @@ from . import browserthumb as bthumb
 from . import pwthumb
 from . import projects as proj
 from . import approvals as apv
+from . import voicekit as vk
 from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read them from here)
     build_turn_outcome, build_propose_thread, build_propose_issue, build_space_about, build_topic_title, build_action,
     build_pushed_commits, build_memory_search, build_memory_read, build_memory_propose,
@@ -294,7 +296,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.116"
+VERSION = "0.3.117"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -877,22 +879,16 @@ class HubRefused(Exception):
         self.detail = detail
 
 
-# Voice note recorded with the composer's mic button: the client names it `audio-YYYY-MM-DD-HHMM.<ext>` (recName in
-# client/src/audio.ts). Any other audio (a dropped mp3, a call recording) gets no hint: an audio is not necessarily a voice.
-RECORDING_RE = re.compile(r"audio-\d{4}-\d{2}-\d{2}-\d{4}\.(?:webm|m4a|ogg|mp3|wav|audio)")
+# Voice note recorded with the composer's mic button (vk.RECORDING_RE, shared with the ACP bridge). Any other audio
+# (a dropped mp3, a call recording) gets no hint: an audio is not necessarily a voice.
+RECORDING_RE, is_recording, wants_voice = vk.RECORDING_RE, vk.is_recording, vk.wants_voice
 VOICE_HINT = ("[The human sent a voice note recorded in briefling. Answer what it says, in text as usual: the gateway "
               "gives you its transcript; if it could not transcribe it, the audio file path is given instead, "
               "transcribe it yourself.]\n")
 # The sender ticked « Reply by voice » (`voiceReply` on the note's file, set by the hub from its message): the spoken
-# summary is asked only then, else a voice note gets a text answer only.
-VOICE_REPLY_HINT = ("[They ticked « Reply by voice »: if you have a text-to-speech tool, add after your text a short "
-                    "spoken summary of your answer (2 or 3 sentences, same language), sent as audio.]\n")
-
-
-def is_recording(f: Any) -> bool:
-    """A voice note from the composer's mic button (an audio is not necessarily a voice)."""
-    return (isinstance(f, dict) and str(f.get("mime") or "").startswith("audio/")
-            and bool(RECORDING_RE.fullmatch(str(f.get("name") or ""))))
+# summary is asked only then, else a voice note gets a text answer only. How, by the agent's BRIEFLING_VOICE_MODE
+# (voicekit): a `🔊` last line the plugin speaks (embedded, default), the gateway's TTS tool (hermes), nothing (off).
+VOICE_REPLY_HINT = vk.reply_hint("hermes")
 
 
 # A lead tapped « Voice » with no voice line on (hub message with `voiceAsk`, protocol/preview.ts « Voice on request »).
@@ -906,13 +902,12 @@ VOICE_TALK_HINT = ("[Voice channel open: the human talks to you out loud and eac
                    "their result briefly when it comes back.]\n")
 
 
-def voice_hint(files: Any) -> str:
-    """Hidden nudge: a voice note gets a text answer; plus, when its sender ticked « Reply by voice » and the agent
-    can, a short audio summary."""
-    notes = [f for f in (files if isinstance(files, list) else []) if is_recording(f)]
-    if not notes:
+def voice_hint(files: Any, mode: str = "hermes") -> str:
+    """Hidden nudge: a voice note gets a text answer; plus, when its sender ticked « Reply by voice », the spoken
+    summary as the agent's voice mode makes it (vk.reply_hint)."""
+    if not any(is_recording(f) for f in (files if isinstance(files, list) else [])):
         return ""
-    return VOICE_HINT + (VOICE_REPLY_HINT if any(f.get("voiceReply") is True for f in notes) else "")
+    return VOICE_HINT + (vk.reply_hint(mode) if wants_voice(files) else "")
 
 
 # Text attachments (a long paste the client turns into a collage-<date>.txt): their content rides in the message, as the
@@ -1066,6 +1061,11 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._opened = asyncio.Event()
         self._turns: set = set()  # threads whose turn is running here (processing hooks)
         self._owed_end: Dict[str, str] = {}  # thread -> message id: turn.ended due when its agent run ends
+        # Embedded voice (voicekit): thread -> the `🔊` summary seen in this turn's text (None = asked, not seen yet);
+        # spoken once the turn ends. The venv and the warm worker are made at the first spoken reply.
+        self._speak: Dict[str, Optional[str]] = {}
+        self._voice: Optional[vk.Voice] = None
+        self._voice_tasks: set = set()
         self._spoke: set = set()  # threads with non-empty text posted since their turn started (waiting gate)
         # thread -> {msg_id: text shown}: the agent's words posted in the running turn; a later message of the turn
         # drops what repeats them (strip_posted). Cleared when a turn starts.
@@ -1199,6 +1199,8 @@ class BrieflingAdapter(BasePlatformAdapter):
             await asyncio.get_running_loop().run_in_executor(None, self._previews.close_all)
         self._mark_disconnected()
         self._flow_runner.stop()
+        if self._voice is not None:  # the warm voice worker never outlives the gateway
+            self._voice.stop()
         if getattr(self, "_bg_task", None):
             self._bg_task.cancel()
             self._bg_task = None
@@ -1413,10 +1415,15 @@ class BrieflingAdapter(BasePlatformAdapter):
         media_urls, media_types, kept = await self._download_files(frame.get("files") or [])
         msg_type = inbound_type(msg.get("files"), kept, str(author.get("id") or ""))
         inlined: List[bool] = [False] * len(kept)
+        vmode = vk.mode()
+        if vmode == "embedded" and wants_voice(kept):
+            self._speak[thread] = None
+        else:  # a new message without « Reply by voice »: no audio for this thread any more
+            self._speak.pop(thread, None)
         if not MessageEvent(text=text).get_command():
             pasted, inlined = inline_texts(media_urls, kept, msg.get("files"), str(author.get("id") or ""))
             text = with_context(frame.get("context") or {},
-                                vault.hint(thread) + edit_hint(msg) + reply_hint(msg) + voice_hint(kept) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True
+                                vault.hint(thread) + edit_hint(msg) + reply_hint(msg) + voice_hint(kept, vmode) + (VOICE_ASK_HINT if msg.get("voiceAsk") is True
                                  else VOICE_TALK_HINT if self._previews.share_of(thread, pv.VOICE) else "") + text
                                 + (f"\n\n{pasted}" if pasted else ""),
                                 mounted=self._mounted(str(frame.get("space") or "")))
@@ -1550,6 +1557,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         msg_id = new_id()
         notice = is_notice(content, metadata)
         if not notice:
+            content = self._spoken_cut(chat_id, content)
             content = self._unrepeated(chat_id, msg_id, content, typing=bool((metadata or {}).get("expect_edits")))
             if content is None:  # all of it was posted already in this turn: nothing to show (yet, if streamed)
                 return SendResult(success=True, message_id=msg_id)
@@ -1575,6 +1583,57 @@ class BrieflingAdapter(BasePlatformAdapter):
             return None
         logger.info("[%s] repeat of this turn's text cut in %s (%d -> %d chars)", self.name, thread, len(content), len(kept))
         return kept
+
+    def _spoken_cut(self, thread: str, content: str) -> str:
+        """In a turn that owes a spoken reply, the `🔊` line leaves the text (streamed half-lines too) and its summary
+        is kept for the turn's end."""
+        if thread not in self._speak:
+            return content
+        content, said = vk.split_spoken(content)
+        if said:
+            self._speak[thread] = said
+        return content
+
+    def _say_later(self, thread: str) -> None:
+        said = self._speak.get(thread)
+        if not said:  # the agent wrote no 🔊 line (yet): a later turn of the same message may still
+            return
+        self._speak.pop(thread, None)
+        task = asyncio.get_running_loop().create_task(self._say(thread, said))
+        self._voice_tasks.add(task)
+        task.add_done_callback(self._voice_tasks.discard)
+
+    async def _say(self, thread: str, said: str) -> None:
+        """The summary as an audio note, after the text (the client plays the agent's notes that follow a post, in or
+        out of a turn). The first one installs the voice: a grey line says so instead of a silence."""
+        if self._voice is None:
+            self._voice = vk.Voice()
+        if not self._voice.installed():
+            await self._send_frame({"type": "message.final", "thread": thread, "msg_id": new_id(), "text": vk.INSTALLING,
+                                    "rev": self._next_rev(), "notice": True})
+        path = None
+        try:
+            path = await self._voice.speak(said)
+            r = await self._send_file(thread, path, None, vk.spoken_name())
+            if not r.success:
+                logger.warning("[%s] spoken reply not posted in %s", self.name, thread)
+        except vk.VoiceError as e:
+            logger.warning("[%s] spoken reply failed: %s", self.name, e)
+            await self._send_frame({"type": "message.final", "thread": thread, "msg_id": new_id(),
+                                    "text": vk.failed_line(e), "rev": self._next_rev(), "notice": True})
+        except Exception:
+            logger.warning("[%s] spoken reply crashed", self.name, exc_info=True)
+        finally:
+            if path:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+
+    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+        """Embedded voice: the plugin speaks the `🔊` summary itself, so the gateway's own auto-TTS (Edge by default)
+        never doubles it. The other modes keep the gateway's choice (/voice, voice.auto_tts)."""
+        if vk.mode() == "embedded":
+            return False
+        return super()._should_auto_tts_for_chat(chat_id)
 
     def _record_posted(self, thread: str, msg_id: str, content: str, ok: bool) -> None:
         if ok and content.strip() and thread in self._turns:
@@ -2173,6 +2232,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         return await self._send_file(chat_id, file_path, caption, file_name)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+        content = self._spoken_cut(chat_id, content)
         content = self._unrepeated(chat_id, message_id, content, typing=not finalize)
         if content is None:  # a streamed repeat of this turn's text: the thread keeps what it shows
             return SendResult(success=True, message_id=message_id)
@@ -2319,6 +2379,7 @@ class BrieflingAdapter(BasePlatformAdapter):
         self._spoke.discard(thread)
         self._posted.pop(thread, None)
         self._reset_progress(thread)
+        self._say_later(thread)
         if _thumbs.end(thread):  # the tabs drop the browser thumbnail at once
             await self._send_frame(bthumb.end_frame(thread))
         usage = take_usage(thread)
