@@ -136,7 +136,7 @@ from .tooldefs import (  # noqa: F401 (re-exported: tests and the flow code read
     build_turn_outcome, build_propose_thread, build_propose_issue, build_space_about, build_topic_title, build_action,
     build_pushed_commits, build_memory_search, build_memory_read, build_memory_propose,
     BOARD_REF, BOARD_STATUS_SCHEMA, BOARD_COMMENT_SCHEMA, BOARD_MOVE_SCHEMA, BOARD_SET_SCHEMA, BOARD_LABEL_SCHEMA,
-    FLOW_SWITCH_SCHEMA, FLOW_PREAMBLE,
+    FLOW_SWITCH_SCHEMA, FLOW_PREAMBLE, SCHEMA_NOTE, schema_hint, with_schema,
     reply_hint,
     PREVIEW_SHARE_SCHEMA, PREVIEW_STOP_SCHEMA, VOICE_OPEN_SCHEMA, PREVIEW_SHARED, PREVIEW_ERRORS_TEXT,
     MAX_BRIEF,
@@ -294,7 +294,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = "briefling.v2"
 # Release of this plugin (= `version` in plugin.yaml, both set by the publish script), reported to the hub at every
 # connection so admins see which agents run an outdated plugin. Not part of the protocol version.
-VERSION = "0.3.115"
+VERSION = "0.3.116"
 PROTOCOL_VERSION = 2  # `v` of every frame: the hub refuses any other version
 SCOPE = "briefling/instance"
 MAX_TEXT = 32_000
@@ -2507,6 +2507,17 @@ def _tool_thread(tool: str, task_id: Any) -> Tuple[Optional[str], Optional[str]]
     return (cron, None) if cron else (None, cerr or err)
 
 
+_TOOL_SCHEMAS: Dict[str, Any] = {}  # name -> schema, filled by _register_tool: the schema an argument refusal carries
+
+
+def _bad_args(tool: str, message: str) -> str:
+    """A local argument check refused the call: its message plus the tool's parameters (tooldefs.schema_hint), so the
+    next try is right without tool_describe."""
+    from tools.registry import tool_error
+    hint = schema_hint(_TOOL_SCHEMAS.get(tool))
+    return tool_error(message, **({"schema": hint, "note": SCHEMA_NOTE} if hint is not None else {}))
+
+
 def _on_adapter(tool: str, thread: str, call, timeout: float = 30, any_adapter: bool = False) -> str:
     """Run ``call(adapter)`` on the gateway loop of the adapter serving ``thread`` (tools run in the agent's Python thread).
     ``any_adapter``: a cron's target thread may never have been delivered here; the only connected adapter then serves
@@ -2524,7 +2535,7 @@ def _on_adapter(tool: str, thread: str, call, timeout: float = 30, any_adapter: 
     except RuntimeError:
         pass
     fut = asyncio.run_coroutine_threadsafe(call(adapter), adapter._loop)
-    return json.dumps(fut.result(timeout=timeout), ensure_ascii=False)
+    return json.dumps(with_schema(fut.result(timeout=timeout), _TOOL_SCHEMAS.get(tool)), ensure_ascii=False)
 
 
 def propose_thread_tool(args: Dict[str, Any], **_: Any) -> str:
@@ -2535,7 +2546,7 @@ def propose_thread_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_propose_thread(args)
     if err:
-        return tool_error(err)
+        return _bad_args("propose_thread", err)
     return _on_adapter("propose_thread", thread, lambda a: a.propose_thread(thread, frame))
 
 
@@ -2547,7 +2558,7 @@ def propose_issue_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_propose_issue(args)
     if err:
-        return tool_error(err)
+        return _bad_args("propose_issue", err)
     return _on_adapter("propose_issue", thread, lambda a: a.propose_issue(thread, frame))
 
 
@@ -2561,11 +2572,11 @@ def request_elevation_tool(args: Dict[str, Any], **_: Any) -> str:
     minutes = args.get("minutes")
     reason = " ".join(str(args.get("reason") or "").split())
     if not re.fullmatch(r"\d{12}", account):
-        return tool_error("account is required: the AWS account id, 12 digits.")
+        return _bad_args("request_elevation", "account is required: the AWS account id, 12 digits.")
     if isinstance(minutes, bool) or not isinstance(minutes, int) or not ELEVATION_MINUTES_MIN <= minutes <= ELEVATION_MINUTES_MAX:
-        return tool_error(f"minutes is required: an integer from {ELEVATION_MINUTES_MIN} to {ELEVATION_MINUTES_MAX}.")
+        return _bad_args("request_elevation", f"minutes is required: an integer from {ELEVATION_MINUTES_MIN} to {ELEVATION_MINUTES_MAX}.")
     if not reason or len(reason) > ELEVATION_REASON_MAX:
-        return tool_error(f"reason is required, one line, max {ELEVATION_REASON_MAX} chars.")
+        return _bad_args("request_elevation", f"reason is required, one line, max {ELEVATION_REASON_MAX} chars.")
     return _on_adapter("request_elevation", thread, lambda a: a.request_elevation(thread, account, minutes, reason))
 
 
@@ -2578,7 +2589,7 @@ def ask_choices_tool(args: Dict[str, Any], task_id: str = "", **_: Any) -> str:
         return tool_error(err)
     frame, bad = build_ask_choices(args)
     if bad:
-        return tool_error(bad)
+        return _bad_args("ask_choices", bad)
     return _on_adapter("ask_choices", thread, lambda a: a.ask_choices(thread, frame), timeout=MEDIA_TIMEOUT_S, any_adapter=True)
 
 
@@ -2590,7 +2601,7 @@ def poll_vote_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, bad = build_poll_vote(args)
     if bad:
-        return tool_error(bad)
+        return _bad_args("poll_vote", bad)
     return _on_adapter("poll_vote", thread, lambda a: a.poll_vote(thread, frame))
 
 
@@ -2602,7 +2613,7 @@ def propose_plan_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, bad = build_plan(args)
     if bad:
-        return tool_error(bad)
+        return _bad_args("propose_plan", bad)
     return _on_adapter("propose_plan", thread, lambda a: a.propose_plan(thread, frame))
 
 
@@ -2614,7 +2625,7 @@ def propose_space_about_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_space_about(args)
     if err:
-        return tool_error(err)
+        return _bad_args("propose_space_about", err)
     return _on_adapter("propose_space_about", thread, lambda a: a.propose_space_about(thread, frame))
 
 
@@ -2626,7 +2637,7 @@ def agent_card_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_agent_card(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("agent_card", ferr)
     return _on_adapter("agent_card", thread, lambda a: a.agent_card(thread, frame))
 
 
@@ -2637,7 +2648,7 @@ def _skill_tool(name: str, build: Any, args: Dict[str, Any]) -> str:
         return tool_error(err)
     frame, ferr = build(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args(name, ferr)
     return _on_adapter(name, thread, lambda a: a.skill(thread, frame))
 
 
@@ -2658,7 +2669,7 @@ def _document_tool(name: str, build: Any, args: Dict[str, Any]) -> str:
         return tool_error(err)
     frame, ferr = build(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args(name, ferr)
     return _on_adapter(name, thread, lambda a: a.document(thread, frame))
 
 
@@ -2680,7 +2691,7 @@ def propose_action_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_propose_action(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("propose_action", ferr)
     return _on_adapter("propose_action", thread, lambda a: a.propose_action(thread, frame))
 
 
@@ -2692,7 +2703,7 @@ def applet_propose_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_applet_propose(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("applet_propose", ferr)
     return _on_adapter("applet_propose", thread, lambda a: a.applet_propose(thread, frame))
 
 
@@ -2704,7 +2715,7 @@ def reminder_propose_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_reminder_propose(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("reminder_propose", ferr)
     return _on_adapter("reminder_propose", thread, lambda a: a.reminder_propose(thread, frame))
 
 
@@ -2725,7 +2736,7 @@ def topic_title_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_topic_title(args)
     if err:
-        return tool_error(err)
+        return _bad_args("topic_title", err)
     return _on_adapter("topic_title", thread, lambda a: a.topic_title(thread, frame))
 
 
@@ -2737,7 +2748,7 @@ def turn_outcome_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_turn_outcome(args)
     if err:
-        return tool_error(err)
+        return _bad_args("turn_outcome", err)
     return _on_adapter("turn_outcome", thread, lambda a: a.turn_outcome(thread, frame, str(args.get("text") or "").strip()),
                        timeout=MEDIA_TIMEOUT_S)
 
@@ -2753,7 +2764,7 @@ def acquire_action_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = _ACQUIRE(args)
     if err:
-        return tool_error(err)
+        return _bad_args("acquire_action", err)
     return _on_adapter("acquire_action", thread, lambda a: a.acquire_action(thread, frame))
 
 
@@ -2765,7 +2776,7 @@ def release_action_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = _RELEASE(args)
     if err:
-        return tool_error(err)
+        return _bad_args("release_action", err)
     return _on_adapter("release_action", thread, lambda a: a.release_action(thread, frame))
 
 
@@ -2777,7 +2788,7 @@ def pushed_commits_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_pushed_commits(args)
     if err:
-        return tool_error(err)
+        return _bad_args("pushed_commits", err)
     return _on_adapter("pushed_commits", thread, lambda a: a.pushed_commits(thread, frame))
 
 
@@ -2816,8 +2827,8 @@ def preview_share_tool(args: Dict[str, Any], task_id: Optional[str] = None, **_:
     calling session's (Hermes passes it to every handler: model_tools._execute_tool -> registry.dispatch)."""
     from tools.registry import tool_error
     thread, port, err = _preview_port("preview_share", args)
-    if err:
-        return tool_error(err)
+    if err:  # no briefling session, or a refused target (an argument: the schema helps)
+        return tool_error(err) if _session_thread("preview_share")[1] else _bad_args("preview_share", err)
     if port is pv.VOICE:  # a voice channel: the daemon's url-file must hold its URL and its port must listen
         path = args["voice"]
         try:
@@ -2898,8 +2909,8 @@ def preview_stop_tool(args: Dict[str, Any], **_: Any) -> str:
     """Tool handler: preview.stop of this thread's share on that port."""
     from tools.registry import tool_error
     thread, port, err = _preview_port("preview_stop", args)
-    if err:
-        return tool_error(err)
+    if err:  # no briefling session, or a refused target (an argument: the schema helps)
+        return tool_error(err) if _session_thread("preview_stop")[1] else _bad_args("preview_stop", err)
     return _on_adapter("preview_stop", thread, lambda a: a.preview_stop(thread, port))
 
 
@@ -3037,18 +3048,18 @@ def memory_tag_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     raw = args.get("items")
     if not isinstance(raw, list) or not 1 <= len(raw) <= MEMORY_TAG_BATCH:
-        return tool_error(f"items is required: 1 to {MEMORY_TAG_BATCH} {{id, tags}} from the tagging message.")
+        return _bad_args("memory_tag", f"items is required: 1 to {MEMORY_TAG_BATCH} {{id, tags}} from the tagging message.")
     items: List[Dict[str, Any]] = []
     for it in raw:
         entry = str((it or {}).get("id") or "").strip() if isinstance(it, dict) else ""
         if not ID_RE.match(entry) or any(x["id"] == entry for x in items):
-            return tool_error("each item needs a distinct entry id from the tagging message.")
+            return _bad_args("memory_tag", "each item needs a distinct entry id from the tagging message.")
         title, terr = clean_title(it.get("title"), required=False)
         if terr:
-            return tool_error(f"{entry}: {terr}")
+            return _bad_args("memory_tag", f"{entry}: {terr}")
         tags, terr = clean_tags(it.get("tags"), required=not title)
         if terr:
-            return tool_error(f"{entry}: {terr}")
+            return _bad_args("memory_tag", f"{entry}: {terr}")
         items.append({"id": entry, **({"tags": tags} if tags else {}), **({"title": title} if title else {})})
     return _on_adapter("memory_tag", thread, lambda a: a.memory_tag(thread, items))
 
@@ -3061,13 +3072,13 @@ def memory_tag_merge_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     raw = args.get("merges")
     if not isinstance(raw, list) or not 1 <= len(raw) <= MEMORY_MERGES_MAX:
-        return tool_error(f"merges is required: 1 to {MEMORY_MERGES_MAX} {{from, to}} pairs of the space's tags.")
+        return _bad_args("memory_tag_merge", f"merges is required: 1 to {MEMORY_MERGES_MAX} {{from, to}} pairs of the space's tags.")
     merges: List[Dict[str, str]] = []
     for it in raw:
         src = _tag_of(it.get("from")) if isinstance(it, dict) else None
         dst = _tag_of(it.get("to")) if isinstance(it, dict) else None
         if not src or not dst or src == dst or any(m["from"] == src for m in merges):
-            return tool_error("each merge needs two different tags (from, to), each `from` once.")
+            return _bad_args("memory_tag_merge", "each merge needs two different tags (from, to), each `from` once.")
         merges.append({"from": src, "to": dst})
     return _on_adapter("memory_tag_merge", thread, lambda a: a.memory_tag_merge(thread, merges))
 
@@ -3080,15 +3091,15 @@ def memory_tag_threads_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     raw = args.get("items")
     if not isinstance(raw, list) or not 1 <= len(raw) <= UNTAGGED_OFFERED_MAX:
-        return tool_error(f"items is required: 1 to {UNTAGGED_OFFERED_MAX} {{id, tags}} from the compaction message.")
+        return _bad_args("memory_tag_threads", f"items is required: 1 to {UNTAGGED_OFFERED_MAX} {{id, tags}} from the compaction message.")
     items: List[Dict[str, Any]] = []
     for it in raw:
         conv = str((it or {}).get("id") or "").strip() if isinstance(it, dict) else ""
         if not ID_RE.match(conv) or any(x["id"] == conv for x in items):
-            return tool_error("each item needs a distinct conversation id from the compaction message.")
+            return _bad_args("memory_tag_threads", "each item needs a distinct conversation id from the compaction message.")
         tags, terr = clean_thread_tags(it.get("tags"))
         if terr or not tags:
-            return tool_error(f"{conv}: 1 to {_THREAD_TAGS_MAX} tags from the list in the message.")
+            return _bad_args("memory_tag_threads", f"{conv}: 1 to {_THREAD_TAGS_MAX} tags from the list in the message.")
         items.append({"id": conv, "tags": tags})
     return _on_adapter("memory_tag_threads", thread, lambda a: a.memory_tag_threads(thread, items))
 
@@ -3106,26 +3117,26 @@ def memory_compact_tool(args: Dict[str, Any], **_: Any) -> str:
     drop = args.get("drop") is True
     keep = args.get("keep") is True
     if keep and drop:
-        return tool_error("keep and drop are two different verdicts: one per call.")
+        return _bad_args("memory_compact", "keep and drop are two different verdicts: one per call.")
     if keep:
         text, kind = text or "keep", kind or "fact"
     if not text or len(text) > MEMORY_SYNTHESIS_MAX:
-        return tool_error(f"text is required, max {MEMORY_SYNTHESIS_MAX} chars.")
+        return _bad_args("memory_compact", f"text is required, max {MEMORY_SYNTHESIS_MAX} chars.")
     if isinstance(ids, list) and len(ids) == 1 and not drop and len(text) > MEMORY_TEXT_MAX:
-        return tool_error(f"a rewrite of one entry keeps the entry format: max {MEMORY_TEXT_MAX} chars (decision or pitfall, then why).")
+        return _bad_args("memory_compact", f"a rewrite of one entry keeps the entry format: max {MEMORY_TEXT_MAX} chars (decision or pitfall, then why).")
     if kind not in ("fact", "rule"):
-        return tool_error("kind must be 'fact' or 'rule'.")
+        return _bad_args("memory_compact", "kind must be 'fact' or 'rule'.")
     if (not isinstance(ids, list) or not MEMORY_SUPERSEDES[0] <= len(ids) <= MEMORY_SUPERSEDES[1]
             or not all(isinstance(i, str) and ID_RE.match(i) for i in ids) or len(set(ids)) != len(ids)):
-        return tool_error(f"supersedes is required: {MEMORY_SUPERSEDES[0]} to {MEMORY_SUPERSEDES[1]} distinct entry ids from the compaction message.")
+        return _bad_args("memory_compact", f"supersedes is required: {MEMORY_SUPERSEDES[0]} to {MEMORY_SUPERSEDES[1]} distinct entry ids from the compaction message.")
     if not isinstance(raw, list) or len(raw) > MEMORY_SOURCES_MAX:
-        return tool_error(f"sources: at most {MEMORY_SOURCES_MAX} items.")
+        return _bad_args("memory_compact", f"sources: at most {MEMORY_SOURCES_MAX} items.")
     sources = [" ".join(str(x or "").split()) for x in raw]
     if any(not x or len(x) > MEMORY_SOURCE_MAX for x in sources):
-        return tool_error(f"each source: 1 to {MEMORY_SOURCE_MAX} chars.")
+        return _bad_args("memory_compact", f"each source: 1 to {MEMORY_SOURCE_MAX} chars.")
     tags, terr = clean_tags(args.get("tags") or None, required=False)
     if terr:
-        return tool_error(terr)
+        return _bad_args("memory_compact", terr)
     return _on_adapter("memory_compact", thread, lambda a: a.memory_compact(thread, text, kind, sources, ids, tags or [], drop, keep))
 
 
@@ -3139,11 +3150,11 @@ def memory_review_tool(args: Dict[str, Any], **_: Any) -> str:
     verdict = str(args.get("verdict") or "").strip()
     why = " ".join(str(args.get("why") or "").split())
     if not ID_RE.match(entry):
-        return tool_error("id is required: an entry id from the review message.")
+        return _bad_args("memory_review", "id is required: an entry id from the review message.")
     if verdict not in ("approve", "reject", "human"):
-        return tool_error("verdict must be 'approve', 'reject' or 'human'.")
+        return _bad_args("memory_review", "verdict must be 'approve', 'reject' or 'human'.")
     if not why or len(why) > MEMORY_WHY_MAX:
-        return tool_error(f"why is required: one sentence, max {MEMORY_WHY_MAX} chars.")
+        return _bad_args("memory_review", f"why is required: one sentence, max {MEMORY_WHY_MAX} chars.")
     return _on_adapter("memory_review", thread, lambda a: a.memory_review(thread, entry, verdict, why))
 
 
@@ -3155,7 +3166,7 @@ def memory_search_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_memory_search(args)
     if err:
-        return tool_error(err)
+        return _bad_args("memory_search", err)
     return _on_adapter("memory_search", thread, lambda a: a.memory_lookup(thread, frame))
 
 
@@ -3167,7 +3178,7 @@ def memory_read_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_memory_read(args)
     if err:
-        return tool_error(err)
+        return _bad_args("memory_read", err)
     return _on_adapter("memory_read", thread, lambda a: a.memory_lookup(thread, frame))
 
 
@@ -3180,7 +3191,7 @@ def _introspect_tool(tool: str, build):
             return tool_error(err)
         frame, err = build(args)
         if err:
-            return tool_error(err)
+            return _bad_args(tool, err)
         return _on_adapter(tool, thread, lambda a: a.introspect(thread, frame))
     return handler
 
@@ -3198,7 +3209,7 @@ def radar_signal_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_radar_signal(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("radar_signal", ferr)
     return _on_adapter("radar_signal", thread, lambda a: a.radar_signal(thread, frame))
 
 
@@ -3210,7 +3221,7 @@ def radar_clear_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_radar_clear(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("radar_clear", ferr)
     return _on_adapter("radar_clear", thread, lambda a: a.radar_clear(thread, frame))
 
 
@@ -3222,7 +3233,7 @@ def mail_import_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     mails, merr = build_mail_import(args)
     if merr:
-        return tool_error(merr)
+        return _bad_args("mail_import", merr)
     return _on_adapter("mail_import", thread, lambda a: a.mail_import(thread, mails), timeout=20 + 10 * len(mails))
 
 
@@ -3234,7 +3245,7 @@ def exchange_read_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     xid = str(args.get("id") or "").strip()
     if not xid:
-        return tool_error("id is required.")
+        return _bad_args("exchange_read", "id is required.")
     return _on_adapter("exchange_read", thread, lambda a: a.exchange_read(thread, xid))
 
 
@@ -3246,7 +3257,7 @@ def exchange_summary_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_exchange_summary(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("exchange_summary", ferr)
     return _on_adapter("exchange_summary", thread, lambda a: a.exchange_summary(thread, frame))
 
 
@@ -3258,7 +3269,7 @@ def radar_profile_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_radar_profile(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("radar_profile", ferr)
     return _on_adapter("radar_profile", thread, lambda a: a.radar_profile(thread, frame))
 
 
@@ -3270,7 +3281,7 @@ def radar_profile_edit_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, ferr = build_radar_profile_edit(args)
     if ferr:
-        return tool_error(ferr)
+        return _bad_args("radar_profile_edit", ferr)
     return _on_adapter("radar_profile_edit", thread, lambda a: a.radar_profile_edit(thread, frame))
 
 
@@ -3282,7 +3293,7 @@ def memory_propose_tool(args: Dict[str, Any], **_: Any) -> str:
         return tool_error(err)
     frame, err = build_memory_propose(args)
     if err:
-        return tool_error(err)
+        return _bad_args("memory_propose", err)
     return _on_adapter("memory_propose", thread, lambda a: a.memory_propose(thread, frame))
 
 
@@ -3342,7 +3353,7 @@ def flow_switch_tool(args: Dict[str, Any], **_: Any) -> str:
     try:
         _, space, agent = parse_link(link)
     except SwitchError as e:
-        return tool_error(str(e))
+        return _bad_args("flow_switch", str(e))
     adapter = next((a for a in list(_ADAPTERS) if getattr(a._flow.get(space), "fs", None) is not None
                     and a._flow[space].fs.agent == agent), None) or next(iter(list(_ADAPTERS)), None)
     if adapter is None or adapter._loop is None:
@@ -3402,6 +3413,7 @@ REGISTERED_TOOLS: List[str] = []
 
 
 def _register_tool(ctx, **kw) -> None:
+    _TOOL_SCHEMAS[kw["name"]] = kw.get("schema")
     ctx.register_tool(**kw)
     if kw.get("name") and kw["name"] not in REGISTERED_TOOLS:
         REGISTERED_TOOLS.append(kw["name"])
